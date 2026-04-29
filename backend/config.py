@@ -30,4 +30,9 @@ class Settings(BaseSettings):
     max_attempts_per_challenge: int = 3
     container_memory_limit: str = "16g"
 
+    # STRATEGY: per-solver step budget (0 = unlimited)
+    max_solver_steps: int = 40
+    # STRATEGY: total run cost ceiling in USD (0.0 = unlimited)
+    budget_usd: float = 5.0
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

@@ -30,7 +30,7 @@ from backend.models import model_id_from_spec
 from backend.output_types import solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, SolverResult
+from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, STEP_LIMIT, SolverResult
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,8 @@ class ClaudeSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        # STRATEGY: set True when cumulative steps >= max_solver_steps
+        self._budget_exceeded = False
 
     async def start(self) -> None:
         await self.sandbox.start()
@@ -126,6 +128,32 @@ class ClaudeSolver:
             # Step counting and loop detection for all tools
             self._step_count += 1
             self.tracer.tool_call(tool_name, tool_input, self._step_count)
+
+            # STRATEGY: per-solver step budget — deny all tools once limit is reached
+            max_steps = getattr(self.settings, "max_solver_steps", 40)
+            if max_steps > 0 and self._step_count >= max_steps:
+                if not self._budget_exceeded:
+                    self._budget_exceeded = True
+                    logger.info(
+                        "[%s] Step budget of %d reached at step %d — stopping solver",
+                        self.agent_name, max_steps, self._step_count,
+                    )
+                    self.tracer.event(
+                        "step_budget_exceeded",
+                        step=self._step_count, max_steps=max_steps,
+                    )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Step budget of {max_steps} reached "
+                            f"(used {self._step_count} steps). "
+                            "No more tool calls — write your final answer now."
+                        ),
+                    }
+                }
+
             loop_status = self.loop_detector.check(tool_name, str(tool_input)[:200])
             if loop_status == "break":
                 self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
@@ -342,6 +370,9 @@ class ClaudeSolver:
             # Report per-run metrics so broken-solver detection works
             run_steps = self._step_count - steps_before
             run_cost = self._cost_usd - cost_before
+            # STRATEGY: signal step-budget exhaustion so swarm skips bumping
+            if self._budget_exceeded:
+                return self._result(STEP_LIMIT, run_steps=run_steps, run_cost=run_cost)
             return self._result(GAVE_UP, run_steps=run_steps, run_cost=run_cost)
 
         except asyncio.CancelledError:

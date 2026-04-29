@@ -21,9 +21,6 @@ if TYPE_CHECKING:
 DEFAULT_MODELS: list[str] = [
     "claude-sdk/claude-opus-4-6/medium",
     "claude-sdk/claude-opus-4-6/max",
-    "codex/gpt-5.4",
-    "codex/gpt-5.4-mini",
-    "codex/gpt-5.3-codex",
 ]
 
 # Context window sizes (tokens)

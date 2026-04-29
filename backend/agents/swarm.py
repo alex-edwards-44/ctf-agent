@@ -20,6 +20,7 @@ from backend.solver_base import (
     FLAG_FOUND,
     GAVE_UP,
     QUOTA_ERROR,
+    STEP_LIMIT,
     SolverProtocol,
     SolverResult,
 )
@@ -235,6 +236,14 @@ class ChallengeSwarm:
                 return result, solver
 
             if result.status == CANCELLED:
+                break
+
+            # STRATEGY: step budget exhausted — don't bump, just stop cleanly
+            if result.status == STEP_LIMIT:
+                logger.info(
+                    "[%s/%s] Step budget exhausted after %d steps ($%.4f) — not bumping",
+                    self.meta.name, model_spec, result.step_count, result.cost_usd,
+                )
                 break
 
             # Quota exhaustion: fall back to API-backed Pydantic AI solver

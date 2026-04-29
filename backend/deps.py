@@ -47,6 +47,10 @@ class CoordinatorDeps:
 
     msg_port: int = 0  # 0 = auto-pick free port
 
+    # STRATEGY: per-solver step budget and total run cost ceiling
+    max_solver_steps: int = 40
+    budget_usd: float = 5.0
+
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
     operator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

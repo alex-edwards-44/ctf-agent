@@ -38,6 +38,17 @@ async def do_get_solve_status(deps: CoordinatorDeps) -> str:
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
+    # STRATEGY: cost-aware early stopping — block the LLM from spawning past the budget
+    budget = getattr(deps, "budget_usd", 5.0)
+    if budget > 0 and deps.cost_tracker.total_cost_usd >= budget:
+        msg = (
+            f"Budget ${budget:.2f} reached "
+            f"(spent ${deps.cost_tracker.total_cost_usd:.2f}) — "
+            "not spawning new swarms. Let running swarms finish."
+        )
+        logger.warning("STRATEGY: %s", msg)
+        return msg
+
     # Retire ALL finished swarms before checking capacity
     finished = [
         name for name, swarm in deps.swarms.items()

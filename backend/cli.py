@@ -40,6 +40,11 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--coordinator", default="claude", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
+# STRATEGY: per-solver step budget and total cost ceiling
+@click.option("--max-solver-steps", default=40, type=int, show_default=True,
+              help="Max tool-calls per solver before it stops (0 = unlimited)")
+@click.option("--budget-usd", default=5.0, type=float, show_default=True,
+              help="Total API cost ceiling in USD — no new swarms spawned after this (0 = unlimited)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     ctfd_url: str | None,
@@ -53,6 +58,8 @@ def main(
     coordinator: str,
     max_challenges: int,
     msg_port: int,
+    max_solver_steps: int,
+    budget_usd: float,
     verbose: bool,
 ) -> None:
     """CTF Agent — multi-model solver swarm.
@@ -67,6 +74,9 @@ def main(
     if ctfd_token:
         settings.ctfd_token = ctfd_token
     settings.max_concurrent_challenges = max_challenges
+    # STRATEGY: propagate new strategy flags into Settings so all downstream code sees them
+    settings.max_solver_steps = max_solver_steps
+    settings.budget_usd = budget_usd
 
     model_specs = list(models) if models else list(DEFAULT_MODELS)
 
@@ -75,6 +85,8 @@ def main(
     console.print(f"  Models: {', '.join(model_specs)}")
     console.print(f"  Image: {settings.sandbox_image}")
     console.print(f"  Max challenges: {max_challenges}")
+    console.print(f"  Max solver steps: {max_solver_steps if max_solver_steps > 0 else 'unlimited'}")
+    console.print(f"  Budget: ${budget_usd:.2f}" if budget_usd > 0 else "  Budget: unlimited")
     console.print()
 
     if challenge:

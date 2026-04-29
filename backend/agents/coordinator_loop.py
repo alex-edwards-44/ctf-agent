@@ -52,6 +52,9 @@ def build_deps(
         max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
+        # STRATEGY: thread strategy flags from Settings into deps
+        max_solver_steps=getattr(settings, "max_solver_steps", 40),
+        budget_usd=getattr(settings, "budget_usd", 5.0),
     )
 
     # Pre-load already-pulled challenges
@@ -100,7 +103,9 @@ async def run_event_loop(
         f"CTF is LIVE. {len(poller.known_challenges)} challenges, "
         f"{len(poller.known_solved)} solved.\n"
         f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
-        "Fetch challenges and spawn swarms for all unsolved."
+        # STRATEGY: instruct coordinator to prioritize lower-value (easier) challenges first
+        "Fetch challenges and spawn swarms for all unsolved. "
+        "STRATEGY: prioritize lower point-value challenges first for quick early wins."
     )
 
     try:
@@ -212,6 +217,16 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     """Auto-spawn a swarm for a single challenge if not already running."""
     if challenge_name in deps.swarms:
         return
+
+    # STRATEGY: cost-aware early stopping — don't start new swarms past the budget
+    budget = getattr(deps, "budget_usd", 5.0)
+    if budget > 0 and deps.cost_tracker.total_cost_usd >= budget:
+        logger.warning(
+            "STRATEGY: budget $%.2f reached (spent $%.2f) — skipping swarm for '%s'",
+            budget, deps.cost_tracker.total_cost_usd, challenge_name,
+        )
+        return
+
     active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
     if active >= deps.max_concurrent_challenges:
         return
@@ -226,7 +241,22 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
     unsolved = poller.known_challenges - poller.known_solved
-    for name in sorted(unsolved):
+
+    # STRATEGY: sort by ascending point value so cheaper (easier) challenges are
+    # attempted first, securing early wins before tackling harder ones.
+    try:
+        stubs = await deps.ctfd.fetch_challenge_stubs()
+        value_map = {ch["name"]: ch.get("value", 0) for ch in stubs}
+        sorted_unsolved = sorted(unsolved, key=lambda n: (value_map.get(n, 0), n))
+        logger.info(
+            "STRATEGY: spawning in ascending point order: %s",
+            [(n, value_map.get(n, 0)) for n in sorted_unsolved],
+        )
+    except Exception as e:
+        logger.warning("Could not fetch point values for prioritization: %s — falling back to alphabetical", e)
+        sorted_unsolved = sorted(unsolved)
+
+    for name in sorted_unsolved:
         await _auto_spawn_one(deps, name)
 
 

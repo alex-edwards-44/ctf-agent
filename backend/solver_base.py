@@ -11,6 +11,8 @@ GAVE_UP = "gave_up"
 CANCELLED = "cancelled"
 ERROR = "error"
 QUOTA_ERROR = "quota_error"
+# STRATEGY: per-solver step budget — returned when solver hits --max-solver-steps
+STEP_LIMIT = "step_limit"
 
 # Flag confirmation markers from CTFd
 CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")

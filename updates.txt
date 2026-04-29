@@ -1,0 +1,105 @@
+CTF Agent Demo Setup — 
+CTFd admin panel: http://localhost:8000/admin
+
+Public tunnel URL: https://frontpage-extraction-pursue-volume.trycloudflare.com
+
+Admin username: admin
+
+Admin password: umj3akWOZLbVi3YjfZvS2560
+
+API token: ctfd_3a47cf625e91c094f07605ddd8141dbfe553f672351707713ca4c793a26341a4
+
+Challenges Created
+Pts     Category        Name    Solution Path
+50      misc    Welcome Base64-decode ZmxhZ3t3ZWxjb21lX3RvX2N0Zn0=
+100     crypto  Caesar's Secret ROT13-decode synt{ebg13_vf_abg_pelcgb}
+150     forensics       Hidden Message  strings hidden_message.txt | grep flag
+100     misc    Math Problem    Compute 7 × 13 × 17 × 227 = 351169
+
+Run the agent
+cd ~/ctf-agent && uv run ctf-solve --max-challenges 2 --coordinator claude -v
+Modified agent 
+uv run ctf-solve --max-challenges 4 --coordinator claude --max-solver-steps 25 --budget-usd 3.0 -v
+
+Reset Using http://localhost:8000/admin/reset
+
+
+==========================================
+Date: 2026-04-21
+
+
+I set up a complete end-to-end CTF system running on my laptop, exposed to the public internet, with an autonomous AI agent attacking it.
+The stack is made up of three pieces:
+First, a local CTFd server running in Docker, preloaded with four beginner-friendly challenges
+ spanning misc, crypto, and forensics — base64 decoding, ROT13, a file with a flag in its metadata, 
+ and a simple math problem.
+Second, a Cloudflare tunnel that exposes my local CTFd instance to the public internet at a real HTTPS URL.
+ From the outside, it looks like any other website on the internet.
+Third, the ctf-agent from Veria Labs, configured to point at that public URL. It uses Claude Opus in a
+ multi-solver swarm, with each solver running in its own isolated Docker sandbox.
+How it runs: one Python script (setup.py) bootstraps the whole server side — container, challenges,
+ admin account, API token, public tunnel — and updates the agent's config automatically. To run the agent, 
+ it's a single command.
+
+What was done
+-------------
+
+1. Created ~/ctf-demo/ as the working directory for all new files.
+
+2. Wrote ~/ctf-demo/setup.py — an idempotent Python setup script that:
+   - Pulls and starts ctfd/ctfd:latest in Docker (container name "ctfd", port 8000)
+   - Performs CTFd initial setup via the /setup endpoint (event name "Demo CTF",
+     admin user "admin", randomly generated 24-char password)
+   - Creates an API token for the admin user via /api/v1/tokens
+   - Creates 4 demonstration challenges via the CTFd admin API:
+       [50  pts] misc      - Welcome         (base64-encoded flag in description)
+       [100 pts] crypto    - Caesar's Secret  (ROT13-encoded flag in description)
+       [150 pts] forensics - Hidden Message   (flag embedded in attached text file)
+       [100 pts] misc      - Math Problem     (flag is product of 7×13×17×227=351169)
+   - Registers static flags for each challenge
+   - Uploads hidden_message.txt as the forensics challenge attachment
+   - Installs cloudflared via Homebrew if not present
+   - Starts a cloudflared quick tunnel exposing localhost:8000 to the internet
+   - Verifies the tunnel URL is reachable (using nslookup 8.8.8.8 + curl --resolve
+     to work around a local DNS issue where *.trycloudflare.com does not resolve)
+   - Verifies the API token works against the public URL
+   - Updates ~/ctf-agent/.env with the new CTFD_URL and CTFD_TOKEN
+
+3. Created ~/ctf-demo/hidden_message.txt — the forensics challenge attachment,
+   a plain text file with flag{strings_reveal_all} embedded as a line among
+   innocuous-looking metadata content.
+
+4. Created ~/ctf-demo/admin_password.txt — stores the generated admin password
+   (chmod 600).
+
+5. Modified ~/ctf-agent/.env — replaced CTFD_URL and CTFD_TOKEN with the live
+   tunnel URL and newly created API token. ANTHROPIC_API_KEY was preserved.
+
+Files created/modified
+----------------------
+  NEW  ~/ctf-demo/setup.py
+  NEW  ~/ctf-demo/hidden_message.txt
+  NEW  ~/ctf-demo/admin_password.txt       (chmod 600, contains admin password)
+  NEW  ~/ctf-demo/cloudflared.log          (live tunnel log, created at runtime)
+  NEW  ~/ctf-demo/cloudflared.pid          (PID of background cloudflared process)
+  NEW  ~/ctf-demo/ctfd-data/               (Docker volume mount for CTFd uploads)
+  MOD  ~/ctf-agent/.env                    (CTFD_URL and CTFD_TOKEN updated)
+
+Live credentials (from this run)
+---------------------------------
+  CTFd local URL:    http://localhost:8000
+  CTFd admin panel:  http://localhost:8000/admin
+  Public tunnel URL: https://frontpage-extraction-pursue-volume.trycloudflare.com
+  Admin username:    admin
+  Admin password:    see ~/ctf-demo/admin_password.txt
+  API token:         ctfd_3a47cf625e91c094f07605ddd8141dbfe553f672351707713ca4c793a26341a4
+
+  Note: the tunnel URL changes each time setup.py is re-run.
+
+To run the agent
+----------------
+  cd ~/ctf-agent && uv run ctf-solve --max-challenges 2 --coordinator claude -v
+
+To rebuild the demo from scratch
+---------------------------------
+  python3 ~/ctf-demo/setup.py
