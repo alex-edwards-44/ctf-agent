@@ -1,55 +1,56 @@
-"""Shared coordinator tool logic — called by both Claude SDK and Codex coordinators."""
+"""Shared coordinator tool logic — called by the Claude SDK coordinator."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
-from backend.prompts import ChallengeMeta
-from backend.solver_base import FLAG_FOUND
+from backend.solver_base import TRIAGE_DONE
 
 logger = logging.getLogger(__name__)
 
 
-async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
-    challenges = await deps.ctfd.fetch_all_challenges()
-    solved = await deps.ctfd.fetch_solved_names()
-    result = [
-        {
-            "name": ch.get("name", "?"),
-            "category": ch.get("category", "?"),
-            "value": ch.get("value", 0),
-            "solves": ch.get("solves", 0),
-            "status": "SOLVED" if ch.get("name") in solved else "unsolved",
-            "description": (ch.get("description") or "")[:200],
-        }
-        for ch in challenges
-    ]
-    return json.dumps(result, indent=2)
+async def do_get_triage_status(deps: CoordinatorDeps) -> str:
+    """List all findings with their current triage status."""
+    rows = []
+    for finding in deps.findings:
+        fid = finding.finding_id
+        result = deps.results.get(fid)
+        swarm = deps.swarms.get(fid)
+        active = fid in deps.swarm_tasks and not deps.swarm_tasks[fid].done()
+        if result:
+            verdict = result.get("verdict", "?")
+            status = f"done:{verdict}"
+        elif active:
+            status = "running"
+        else:
+            status = "queued"
+        rows.append({
+            "finding_id": fid,
+            "path": f"{finding.path}:{finding.line}",
+            "rule_id": finding.rule_id,
+            "severity": finding.severity,
+            "status": status,
+        })
+    return json.dumps(rows, indent=2)
 
 
-async def do_get_solve_status(deps: CoordinatorDeps) -> str:
-    solved = await deps.ctfd.fetch_solved_names()
-    swarm_status = {name: swarm.get_status() for name, swarm in deps.swarms.items()}
-    return json.dumps({"solved": sorted(solved), "active_swarms": swarm_status}, indent=2)
-
-
-async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    # STRATEGY: cost-aware early stopping — block the LLM from spawning past the budget
-    budget = getattr(deps, "budget_usd", 5.0)
+async def do_spawn_swarm(deps: CoordinatorDeps, finding_id: str) -> str:
+    """Spawn a swarm of solvers to triage a single finding."""
+    # STRATEGY: cost-aware early stopping
+    budget = getattr(deps, "budget_usd", 10.0)
     if budget > 0 and deps.cost_tracker.total_cost_usd >= budget:
         msg = (
             f"Budget ${budget:.2f} reached "
             f"(spent ${deps.cost_tracker.total_cost_usd:.2f}) — "
-            "not spawning new swarms. Let running swarms finish."
+            "not spawning new swarms."
         )
         logger.warning("STRATEGY: %s", msg)
         return msg
 
-    # Retire ALL finished swarms before checking capacity
+    # Retire finished swarms before checking capacity
     finished = [
         name for name, swarm in deps.swarms.items()
         if swarm.cancel_event.is_set()
@@ -60,115 +61,108 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         deps.swarm_tasks.pop(name, None)
 
     active_count = len(deps.swarms)
-    if active_count >= deps.max_concurrent_challenges:
-        return f"At capacity ({active_count}/{deps.max_concurrent_challenges} challenges running). Wait for one to finish."
+    if active_count >= deps.max_concurrent_findings:
+        return f"At capacity ({active_count}/{deps.max_concurrent_findings} running). Wait for one to finish."
 
-    if challenge_name in deps.swarms:
-        return f"Swarm still running for {challenge_name}"
+    if finding_id in deps.swarms:
+        return f"Swarm still running for {finding_id}"
 
-    # Auto-pull challenge if needed
-    if challenge_name not in deps.challenge_dirs:
-        challenges = await deps.ctfd.fetch_all_challenges()
-        ch_data = next((c for c in challenges if c.get("name") == challenge_name), None)
-        if not ch_data:
-            return f"Challenge '{challenge_name}' not found on CTFd"
-        output_dir = str(Path(deps.challenges_root))
-        ch_dir = await deps.ctfd.pull_challenge(ch_data, output_dir)
-        deps.challenge_dirs[challenge_name] = ch_dir
-        deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(ch_dir) / "metadata.yml")
+    if finding_id in deps.results:
+        return f"Finding {finding_id} already triaged: {deps.results[finding_id].get('verdict', '?')}"
 
-    from backend.agents.swarm import ChallengeSwarm
+    # Find the SemgrepFinding object
+    finding = next((f for f in deps.findings if f.finding_id == finding_id), None)
+    if finding is None:
+        return f"Finding '{finding_id}' not in findings list"
 
-    swarm = ChallengeSwarm(
-        challenge_dir=deps.challenge_dirs[challenge_name],
-        meta=deps.challenge_metas[challenge_name],
-        ctfd=deps.ctfd,
+    from backend.agents.swarm import FindingSwarm
+
+    swarm = FindingSwarm(
+        finding=finding,
+        target_dir=deps.target_dir,
         cost_tracker=deps.cost_tracker,
         settings=deps.settings,
         model_specs=deps.model_specs,
-        no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
     )
-    deps.swarms[challenge_name] = swarm
+    deps.swarms[finding_id] = swarm
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        # Flag already submitted/confirmed by solver's submit_fn — just record the result
-        if result and result.status == FLAG_FOUND:
-            deps.results[challenge_name] = {
-                "flag": result.flag,
-                "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
+        if result and result.status == TRIAGE_DONE and result.verdict:
+            v = result.verdict
+            deps.results[finding_id] = {
+                "verdict": v.verdict,
+                "confidence": v.confidence,
+                "reasoning": v.reasoning,
+                "exploitability": v.exploitability,
+                "proof_of_concept": v.proof_of_concept,
+                "remediation": v.remediation,
+                "verdict_obj": v,
             }
+            logger.info(
+                "Triage complete for %s: %s (confidence=%.2f)",
+                finding_id, v.verdict, v.confidence,
+            )
+        else:
+            deps.results[finding_id] = {"verdict": "uncertain", "reasoning": "Solver did not return a verdict."}
 
-    task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
-    deps.swarm_tasks[challenge_name] = task
-    return f"Swarm spawned for {challenge_name} with {len(deps.model_specs)} models"
+    import asyncio
+    task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{finding_id}")
+    deps.swarm_tasks[finding_id] = task
+    return f"Swarm spawned for {finding_id} ({finding.path}:{finding.line}) with {len(deps.model_specs)} model(s)"
 
 
-async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> str:
-    swarm = deps.swarms.get(challenge_name)
+async def do_kill_swarm(deps: CoordinatorDeps, finding_id: str) -> str:
+    swarm = deps.swarms.get(finding_id)
     if not swarm:
-        return f"No swarm running for {challenge_name}"
-    return json.dumps(swarm.get_status(), indent=2)
-
-
-async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
-    if deps.no_submit:
-        return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
-    try:
-        result = await deps.ctfd.submit_flag(challenge_name, flag)
-        return result.display
-    except Exception as e:
-        return f"submit_flag error: {e}"
-
-
-async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    swarm = deps.swarms.get(challenge_name)
-    if not swarm:
-        return f"No swarm running for {challenge_name}"
+        return f"No swarm running for {finding_id}"
     swarm.kill()
-    return f"Swarm for {challenge_name} cancelled"
+    return f"Swarm for {finding_id} cancelled"
 
 
-async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str) -> str:
-    swarm = deps.swarms.get(challenge_name)
+async def do_bump_solver(
+    deps: CoordinatorDeps, finding_id: str, model_spec: str, insights: str
+) -> str:
+    swarm = deps.swarms.get(finding_id)
     if not swarm:
-        return f"No swarm running for {challenge_name}"
+        return f"No swarm running for {finding_id}"
     solver = swarm.solvers.get(model_spec)
     if not solver:
-        return f"No solver for {model_spec} in {challenge_name}"
+        return f"No solver for {model_spec} in {finding_id}"
     solver.bump(insights)
-    return f"Bumped {model_spec} on {challenge_name}"
+    return f"Bumped {model_spec} on {finding_id}"
 
 
-async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20) -> str:
+async def do_read_solver_trace(
+    deps: CoordinatorDeps, finding_id: str, model_spec: str, last_n: int = 20
+) -> str:
     """Read the last N trace events from a solver's JSONL log."""
-    swarm = deps.swarms.get(challenge_name)
+    swarm = deps.swarms.get(finding_id)
     if not swarm:
-        return f"No swarm for {challenge_name}"
+        return f"No swarm for {finding_id}"
     solver = swarm.solvers.get(model_spec)
     if not solver:
         return f"No solver for {model_spec}"
-    trace_path = getattr(solver, "tracer", None)
-    if not trace_path:
+    trace_obj = getattr(solver, "tracer", None)
+    if not trace_obj:
         return "No tracer on solver"
-    path = trace_path.path if hasattr(trace_path, "path") else str(trace_path)
+    path = trace_obj.path if hasattr(trace_obj, "path") else str(trace_obj)
     try:
         lines = Path(path).read_text().strip().split("\n")
         recent = lines[-last_n:]
         summary = []
+        import json as _json
         for line in recent:
             try:
-                d = json.loads(line)
+                d = _json.loads(line)
                 t = d.get("type", "?")
                 if t == "tool_call":
-                    args_str = str(d.get("args", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {args_str}")
+                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {str(d.get('args',''))[:100]}")
                 elif t == "tool_result":
-                    result_str = str(d.get("result", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {result_str}")
-                elif t in ("finish", "error", "bump", "turn_failed"):
-                    summary.append(f"** {t}: {json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
+                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {str(d.get('result',''))[:100]}")
+                elif t in ("finish", "error", "bump", "triage_submitted"):
+                    summary.append(f"** {t}: {_json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
                 elif t == "usage":
                     summary.append(f"usage: in={d.get('input_tokens',0)} out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
                 else:
@@ -182,10 +176,9 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
         return f"Error reading trace: {e}"
 
 
-async def do_broadcast(deps: CoordinatorDeps, challenge_name: str, message: str) -> str:
-    """Broadcast a message to all solvers working on a challenge."""
-    swarm = deps.swarms.get(challenge_name)
+async def do_broadcast(deps: CoordinatorDeps, finding_id: str, message: str) -> str:
+    swarm = deps.swarms.get(finding_id)
     if not swarm:
-        return f"No swarm running for {challenge_name}"
+        return f"No swarm running for {finding_id}"
     await swarm.message_bus.broadcast(message)
-    return f"Broadcast to all solvers on {challenge_name}"
+    return f"Broadcast to all solvers on {finding_id}"

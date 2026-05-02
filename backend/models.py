@@ -17,10 +17,11 @@ from pydantic_ai.settings import ModelSettings
 if TYPE_CHECKING:
     from backend.config import Settings
 
-# Default model specs — claude-sdk and codex providers use the new solver backends
+# Default model specs for vuln-triage
 DEFAULT_MODELS: list[str] = [
     "claude-sdk/claude-opus-4-6/medium",
     "claude-sdk/claude-opus-4-6/max",
+    "google/gemini-3-flash-preview",
 ]
 
 # Context window sizes (tokens)
@@ -86,9 +87,9 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                 model_id,
                 provider=GoogleProvider(api_key=settings.gemini_api_key),
             )
-        case "claude-sdk" | "codex":
+        case "claude-sdk":
             raise ValueError(
-                f"Provider '{provider}' uses its own solver backend, not Pydantic AI. "
+                f"Provider 'claude-sdk' uses its own solver backend, not Pydantic AI. "
                 f"resolve_model() should not be called for {spec}."
             )
         case _:
@@ -107,12 +108,7 @@ def resolve_model_settings(spec: str) -> ModelSettings:
                 bedrock_cache_messages=True,
             )
         case "azure" | "zen":
-            # Azure/Zen use OpenAI chat completions — server-side prompt caching
-            # is automatic, no explicit config needed. Set max_tokens to avoid
-            # reserving the full context window.
-            return OpenAIModelSettings(
-                max_tokens=128_000,
-            )
+            return OpenAIModelSettings(max_tokens=128_000)
         case "google":
             return GoogleModelSettings(
                 max_tokens=64_000,

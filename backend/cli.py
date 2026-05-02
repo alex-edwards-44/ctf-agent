@@ -1,4 +1,4 @@
-"""Click CLI entry point."""
+"""vuln-triage CLI entry point."""
 
 from __future__ import annotations
 
@@ -24,181 +24,205 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("aiodocker").setLevel(logging.WARNING)
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%X"))
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%X")
+    )
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 @click.command()
-@click.option("--ctfd-url", default=None, help="CTFd URL (overrides .env)")
-@click.option("--ctfd-token", default=None, help="CTFd API token (overrides .env)")
-@click.option("--image", default="ctf-sandbox", help="Docker sandbox image name")
-@click.option("--models", multiple=True, help="Model specs (default: all configured)")
-@click.option("--challenge", default=None, help="Solve a single challenge directory")
-@click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
-@click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: claude-opus-4-6)")
-@click.option("--coordinator", default="claude", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
-@click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
-@click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
-# STRATEGY: per-solver step budget and total cost ceiling
-@click.option("--max-solver-steps", default=40, type=int, show_default=True,
-              help="Max tool-calls per solver before it stops (0 = unlimited)")
-@click.option("--budget-usd", default=5.0, type=float, show_default=True,
-              help="Total API cost ceiling in USD — no new swarms spawned after this (0 = unlimited)")
+@click.argument("target", metavar="<github-url-or-local-path>")
+@click.option("--max-concurrent", default=4, type=int, show_default=True,
+              help="Max findings triaged in parallel")
+@click.option("--max-solver-steps", default=30, type=int, show_default=True,
+              help="Per-solver tool-call cap (0 = unlimited)")
+@click.option("--budget-usd", default=10.0, type=float, show_default=True,
+              help="Total API cost ceiling in USD (0 = unlimited)")
+@click.option("--severity", default="warning",
+              type=click.Choice(["error", "warning", "info", "all"], case_sensitive=False),
+              show_default=True, help="Minimum Semgrep severity to triage")
+@click.option("--output", default="report.md", show_default=True,
+              help="Output path for the markdown report")
+@click.option("--image", default="vuln-sandbox", show_default=True,
+              help="Docker sandbox image name")
+@click.option("--models", multiple=True,
+              help="Model specs (repeatable; default: all configured)")
+@click.option("--coordinator-model", default=None,
+              help="Model for coordinator (default: claude-opus-4-6)")
+@click.option("--semgrep-config", default=None,
+              help="Custom Semgrep rules file or registry config (overrides auto)")
+@click.option("--no-cleanup", is_flag=True,
+              help="Don't delete the cloned repo at end (for debugging)")
+@click.option("--msg-port", default=0, type=int,
+              help="Operator message port (0 = auto)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
-    ctfd_url: str | None,
-    ctfd_token: str | None,
-    image: str,
-    models: tuple[str, ...],
-    challenge: str | None,
-    challenges_dir: str,
-    no_submit: bool,
-    coordinator_model: str | None,
-    coordinator: str,
-    max_challenges: int,
-    msg_port: int,
+    target: str,
+    max_concurrent: int,
     max_solver_steps: int,
     budget_usd: float,
+    severity: str,
+    output: str,
+    image: str,
+    models: tuple[str, ...],
+    coordinator_model: str | None,
+    semgrep_config: str | None,
+    no_cleanup: bool,
+    msg_port: int,
     verbose: bool,
 ) -> None:
-    """CTF Agent — multi-model solver swarm.
-
-    Run without --challenge to start the full coordinator (Ctrl+C to stop).
-    """
+    """vuln-triage — Semgrep-driven vulnerability triage with a multi-model solver swarm."""
     _setup_logging(verbose)
+    asyncio.run(
+        _run(
+            target=target,
+            max_concurrent=max_concurrent,
+            max_solver_steps=max_solver_steps,
+            budget_usd=budget_usd,
+            severity=severity,
+            output=output,
+            image=image,
+            model_specs=list(models) if models else list(DEFAULT_MODELS),
+            coordinator_model=coordinator_model,
+            semgrep_config=semgrep_config,
+            no_cleanup=no_cleanup,
+            msg_port=msg_port,
+        )
+    )
+
+
+async def _run(
+    target: str,
+    max_concurrent: int,
+    max_solver_steps: int,
+    budget_usd: float,
+    severity: str,
+    output: str,
+    image: str,
+    model_specs: list[str],
+    coordinator_model: str | None,
+    semgrep_config: str | None,
+    no_cleanup: bool,
+    msg_port: int,
+) -> None:
+    from backend.repo_loader import RepoLoader
+    from backend.sandbox import cleanup_orphan_containers, configure_semaphore
+    from backend.scanner import run_semgrep
 
     settings = Settings(sandbox_image=image)
-    if ctfd_url:
-        settings.ctfd_url = ctfd_url
-    if ctfd_token:
-        settings.ctfd_token = ctfd_token
-    settings.max_concurrent_challenges = max_challenges
-    # STRATEGY: propagate new strategy flags into Settings so all downstream code sees them
+    settings.max_concurrent_findings = max_concurrent
     settings.max_solver_steps = max_solver_steps
     settings.budget_usd = budget_usd
 
-    model_specs = list(models) if models else list(DEFAULT_MODELS)
-
-    console.print("[bold]CTF Agent v2[/bold]")
-    console.print(f"  CTFd: {settings.ctfd_url}")
-    console.print(f"  Models: {', '.join(model_specs)}")
-    console.print(f"  Image: {settings.sandbox_image}")
-    console.print(f"  Max challenges: {max_challenges}")
+    console.print("[bold]vuln-triage[/bold]")
+    console.print(f"  Target:           {target}")
+    console.print(f"  Models:           {', '.join(model_specs)}")
+    console.print(f"  Max concurrent:   {max_concurrent}")
     console.print(f"  Max solver steps: {max_solver_steps if max_solver_steps > 0 else 'unlimited'}")
-    console.print(f"  Budget: ${budget_usd:.2f}" if budget_usd > 0 else "  Budget: unlimited")
+    console.print(f"  Budget:           {'$' + f'{budget_usd:.2f}' if budget_usd > 0 else 'unlimited'}")
+    console.print(f"  Severity filter:  {severity}")
+    console.print(f"  Output:           {output}")
     console.print()
 
-    if challenge:
-        asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges))
-    else:
-        asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port))
-
-
-async def _run_single(
-    settings: Settings,
-    challenge_dir: str,
-    model_specs: list[str],
-    no_submit: bool,
-    max_challenges: int,
-) -> None:
-    """Run a single challenge with a swarm."""
-    from backend.agents.swarm import ChallengeSwarm
-    from backend.cost_tracker import CostTracker
-    from backend.ctfd import CTFdClient
-    from backend.prompts import ChallengeMeta
-    from backend.sandbox import cleanup_orphan_containers, configure_semaphore
-
-    max_containers = max_challenges * len(model_specs)
-    configure_semaphore(max_containers)
+    configure_semaphore(max_concurrent * len(model_specs))
     await cleanup_orphan_containers()
 
-    challenge_path = Path(challenge_dir)
-    meta_path = challenge_path / "metadata.yml"
-    if not meta_path.exists():
-        console.print(f"[red]No metadata.yml found in {challenge_dir}[/red]")
-        sys.exit(1)
-
-    meta = ChallengeMeta.from_yaml(meta_path)
-    console.print(f"[bold]Challenge:[/bold] {meta.name} ({meta.category}, {meta.value} pts)")
-
-    ctfd = CTFdClient(
-        base_url=settings.ctfd_url,
-        token=settings.ctfd_token,
-        username=settings.ctfd_user,
-        password=settings.ctfd_pass,
-    )
-    cost_tracker = CostTracker()
-
-    swarm = ChallengeSwarm(
-        challenge_dir=str(challenge_path),
-        meta=meta,
-        ctfd=ctfd,
-        cost_tracker=cost_tracker,
-        settings=settings,
-        model_specs=model_specs,
-        no_submit=no_submit,
-    )
+    loader = RepoLoader(target, no_cleanup=no_cleanup)
+    local_path = loader._resolve()
 
     try:
-        result = await swarm.run()
-        from backend.solver_base import FLAG_FOUND
-        if result and result.status == FLAG_FOUND:
-            console.print(f"\n[bold green]FLAG FOUND:[/bold green] {result.flag}")
+        # Step 1: Run Semgrep
+        console.print("[bold]Step 1: Running Semgrep...[/bold]")
+        if semgrep_config:
+            findings = run_semgrep(local_path, config=semgrep_config, severity_min=severity)
         else:
-            console.print("\n[bold red]No flag found.[/bold red]")
+            findings = run_semgrep(local_path, config="auto", severity_min=severity)
+            if not findings:
+                console.print("[yellow]No findings from --config=auto. Retrying with --config=p/security-audit...[/yellow]")
+                findings = run_semgrep(local_path, config="p/security-audit", severity_min=severity)
 
-        console.print("\n[bold]Cost Summary:[/bold]")
-        for agent_name in cost_tracker.by_agent:
-            console.print(f"  {agent_name}: {cost_tracker.format_usage(agent_name)}")
-        console.print(f"  [bold]Total: ${cost_tracker.total_cost_usd:.2f}[/bold]")
-    finally:
-        await ctfd.close()
+        if not findings:
+            console.print("[yellow]No Semgrep findings. Nothing to triage.[/yellow]")
+            _write_empty_report(output, target)
+            return
 
+        console.print(f"[green]Found {len(findings)} finding(s) to triage.[/green]\n")
+        for i, f in enumerate(findings, 1):
+            console.print(f"  [{i:3d}] {f.severity:7s}  {f.path}:{f.line}  ({f.rule_id})")
+        console.print()
 
-async def _run_coordinator(
-    settings: Settings,
-    model_specs: list[str],
-    challenges_dir: str,
-    no_submit: bool,
-    coordinator_model: str | None,
-    coordinator_backend: str,
-    max_challenges: int,
-    msg_port: int = 0,
-) -> None:
-    """Run the full coordinator (continuous until Ctrl+C)."""
-    from backend.sandbox import cleanup_orphan_containers, configure_semaphore
+        # Step 2: Triage
+        console.print("[bold]Step 2: Triaging findings...[/bold]\n")
 
-    max_containers = max_challenges * len(model_specs)
-    configure_semaphore(max_containers)
-    await cleanup_orphan_containers()
-    console.print(f"[bold]Starting coordinator ({coordinator_backend}, Ctrl+C to stop)...[/bold]\n")
-
-    if coordinator_backend == "codex":
-        from backend.agents.codex_coordinator import run_codex_coordinator
-        results = await run_codex_coordinator(
-            settings=settings,
-            model_specs=model_specs,
-            challenges_root=challenges_dir,
-            no_submit=no_submit,
-            coordinator_model=coordinator_model,
-            msg_port=msg_port,
-        )
-    else:
         from backend.agents.claude_coordinator import run_claude_coordinator
-        results = await run_claude_coordinator(
+
+        run_result = await run_claude_coordinator(
             settings=settings,
+            findings=findings,
+            target_dir=local_path,
             model_specs=model_specs,
-            challenges_root=challenges_dir,
-            no_submit=no_submit,
             coordinator_model=coordinator_model,
             msg_port=msg_port,
         )
 
-    console.print("\n[bold]Final Results:[/bold]")
-    for challenge, data in results.get("results", {}).items():
-        console.print(f"  {challenge}: {data.get('flag', 'no flag')}")
-    console.print(f"\n[bold]Total cost: ${results.get('total_cost_usd', 0):.2f}[/bold]")
+        verdicts_raw = run_result.get("results", {})
+        total_cost = run_result.get("total_cost_usd", 0.0)
+
+        # Step 3: Generate report
+        console.print("\n[bold]Step 3: Generating report...[/bold]")
+
+        from backend.output_types import TriageVerdict
+        from backend.report import generate_report
+
+        verdicts: dict[str, TriageVerdict] = {}
+        for fid, data in verdicts_raw.items():
+            v = data.get("verdict_obj")
+            if isinstance(v, TriageVerdict):
+                verdicts[fid] = v
+            elif isinstance(data, dict) and "verdict" in data:
+                try:
+                    verdicts[fid] = TriageVerdict(
+                        finding_id=fid,
+                        verdict=data["verdict"],
+                        confidence=data.get("confidence", 0.5),
+                        reasoning=data.get("reasoning", ""),
+                        exploitability=data.get("exploitability", "n/a"),
+                        proof_of_concept=data.get("proof_of_concept"),
+                        remediation=data.get("remediation"),
+                    )
+                except Exception:
+                    pass
+
+        report_md = generate_report(
+            findings=findings,
+            verdicts=verdicts,
+            target=target,
+            total_cost_usd=total_cost,
+        )
+
+        Path(output).write_text(report_md)
+        console.print(f"[green]Report written to:[/green] {output}\n")
+
+        # Summary
+        from collections import Counter
+        counts = Counter(v.verdict for v in verdicts.values())
+        console.print("[bold]Triage Summary:[/bold]")
+        console.print(f"  Confirmed:      {counts.get('confirmed', 0)}")
+        console.print(f"  Likely:         {counts.get('likely', 0)}")
+        console.print(f"  Uncertain:      {counts.get('uncertain', 0)}")
+        console.print(f"  False positive: {counts.get('false_positive', 0)}")
+        console.print(f"  Not triaged:    {len(findings) - len(verdicts)}")
+        console.print(f"\n[bold]Total cost: ${total_cost:.2f}[/bold]")
+
+    finally:
+        loader.cleanup()
+
+
+def _write_empty_report(output: str, target: str) -> None:
+    from backend.report import generate_report
+    report = generate_report(findings=[], verdicts={}, target=target, total_cost_usd=0.0)
+    Path(output).write_text(report)
+    console.print(f"Empty report written to: {output}")
 
 
 @click.command()
@@ -223,7 +247,6 @@ def msg(message: str, port: int, host: str) -> None:
             console.print(f"[green]Sent:[/green] {data.get('queued', message[:200])}")
     except Exception as e:
         console.print(f"[red]Failed:[/red] {e}")
-        console.print("Is the coordinator running?")
         sys.exit(1)
 
 

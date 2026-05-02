@@ -8,48 +8,42 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from backend.cost_tracker import CostTracker
-from backend.ctfd import CTFdClient
 from backend.sandbox import DockerSandbox
 
 if TYPE_CHECKING:
-    from backend.message_bus import ChallengeMessageBus
+    from backend.message_bus import FindingMessageBus
+    from backend.output_types import SemgrepFinding
 
-# Type for the deduped submit callback: (flag) -> (display, is_confirmed)
-SubmitFn = Callable[[str], Coroutine[Any, Any, tuple[str, bool]]]
+# Type for the triage submit callback: (verdict_dict) -> display_str
+TriageSubmitFn = Callable[[dict], Coroutine[Any, Any, str]]
 
 
 @dataclass
 class SolverDeps:
     sandbox: DockerSandbox
-    ctfd: CTFdClient
-    challenge_dir: str
-    challenge_name: str
-    workspace_dir: str
-    use_vision: bool
+    finding_id: str
+    target_dir: str
     cost_tracker: CostTracker | None = None
-    confirmed_flag: str | None = None
-    message_bus: ChallengeMessageBus | None = None
+    message_bus: FindingMessageBus | None = None
     model_spec: str = ""
-    submit_fn: SubmitFn | None = None  # Deduped flag submission via swarm
-    no_submit: bool = False
+    triage_fn: TriageSubmitFn | None = None
     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
 
 
 @dataclass
 class CoordinatorDeps:
-    ctfd: CTFdClient
     cost_tracker: CostTracker
     settings: Any
+    findings: list[Any] = field(default_factory=list)  # list[SemgrepFinding]
     model_specs: list[str] = field(default_factory=list)
-    challenges_root: str = "challenges"
-    no_submit: bool = False
-    max_concurrent_challenges: int = 10
+    findings_dir: str = "findings"
+    max_concurrent_findings: int = 4
 
-    msg_port: int = 0  # 0 = auto-pick free port
+    msg_port: int = 0
 
     # STRATEGY: per-solver step budget and total run cost ceiling
-    max_solver_steps: int = 40
-    budget_usd: float = 5.0
+    max_solver_steps: int = 30
+    budget_usd: float = 10.0
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -57,5 +51,3 @@ class CoordinatorDeps:
     swarms: dict[str, Any] = field(default_factory=dict)
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)
-    challenge_dirs: dict[str, str] = field(default_factory=dict)
-    challenge_metas: dict[str, Any] = field(default_factory=dict)

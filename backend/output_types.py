@@ -1,26 +1,55 @@
 """Structured output types for solver agents."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
 from pydantic import BaseModel
 
 
-class FlagFound(BaseModel):
-    flag: str
-    method: str  # brief description of how
+@dataclass
+class SemgrepFinding:
+    """A single finding produced by Semgrep."""
+
+    finding_id: str       # stable hash of rule_id + path + line
+    path: str             # relative to target repo root
+    line: int
+    rule_id: str
+    severity: str         # ERROR | WARNING | INFO
+    message: str
+    code_snippet: str
+    cwe: str              # CWE tag or empty string
+
+
+class TriageVerdict(BaseModel):
+    finding_id: str
+    verdict: Literal["confirmed", "likely", "uncertain", "false_positive"]
+    confidence: float     # 0.0 to 1.0
+    reasoning: str        # solver's explanation (2-4 sentences)
+    exploitability: Literal["trivial", "moderate", "difficult", "n/a"]
+    proof_of_concept: Optional[str] = None
+    remediation: Optional[str] = None
 
 
 def solver_output_json_schema() -> dict:
-    """JSON schema for solver structured output — shared by Claude SDK and Codex.
-
-    Only flag_found is allowed — solvers must keep working until they find a flag.
-    No gave_up option forces persistent solving behavior.
-    """
+    """JSON schema for solver structured output — submitted at end of triage turn."""
     return {
         "type": "object",
         "properties": {
-            "type": {"type": "string", "enum": ["flag_found"]},
-            "flag": {"type": "string"},
-            "method": {"type": "string"},
+            "verdict": {
+                "type": "string",
+                "enum": ["confirmed", "likely", "uncertain", "false_positive"],
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "reasoning": {"type": "string"},
+            "exploitability": {
+                "type": "string",
+                "enum": ["trivial", "moderate", "difficult", "n/a"],
+            },
+            "proof_of_concept": {"type": ["string", "null"]},
+            "remediation": {"type": ["string", "null"]},
         },
-        "required": ["type", "flag", "method"],
+        "required": ["verdict", "confidence", "reasoning", "exploitability"],
         "additionalProperties": False,
     }

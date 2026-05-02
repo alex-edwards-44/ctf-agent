@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 # Status constants
-FLAG_FOUND = "flag_found"
+TRIAGE_DONE = "triage_done"    # solver submitted a triage verdict
 GAVE_UP = "gave_up"
 CANCELLED = "cancelled"
 ERROR = "error"
@@ -14,13 +14,10 @@ QUOTA_ERROR = "quota_error"
 # STRATEGY: per-solver step budget — returned when solver hits --max-solver-steps
 STEP_LIMIT = "step_limit"
 
-# Flag confirmation markers from CTFd
-CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")
-
 
 @dataclass
 class SolverResult:
-    flag: str | None
+    verdict: Any          # TriageVerdict | None
     status: str
     findings_summary: str
     step_count: int
@@ -29,7 +26,7 @@ class SolverResult:
 
 
 class SolverProtocol(Protocol):
-    """Common interface for all solver backends (Pydantic AI, Claude SDK, Codex)."""
+    """Common interface for all solver backends."""
 
     model_spec: str
     agent_name: str

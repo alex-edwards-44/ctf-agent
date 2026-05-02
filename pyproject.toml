@@ -1,7 +1,7 @@
 [project]
-name = "ctf-agent-two"
+name = "vuln-triage"
 version = "0.1.0"
-description = "CTF agent v2 — multi-model solver swarm"
+description = "vuln-triage — Semgrep-driven vulnerability triage with a multi-model solver swarm"
 requires-python = ">=3.14"
 dependencies = [
     "pydantic-ai[bedrock,openai,google]",
@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.scripts]
-ctf-solve = "backend.cli:main"
-ctf-msg = "backend.cli:msg"
+vuln-triage = "backend.cli:main"
+vuln-triage-msg = "backend.cli:msg"
 
 [build-system]
 requires = ["hatchling"]

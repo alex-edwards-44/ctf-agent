@@ -1,4 +1,4 @@
-"""Claude Agent SDK coordinator — uses the shared event loop with a Claude SDK client."""
+"""Claude Agent SDK coordinator for vuln-triage."""
 
 from __future__ import annotations
 
@@ -16,117 +16,80 @@ from claude_agent_sdk import (
 
 from backend.agents.coordinator_core import (
     do_broadcast,
-    do_bump_agent,
-    do_check_swarm_status,
-    do_fetch_challenges,
-    do_get_solve_status,
+    do_bump_solver,
+    do_get_triage_status,
     do_kill_swarm,
     do_read_solver_trace,
     do_spawn_swarm,
-    do_submit_flag,
 )
-from backend.agents.coordinator_loop import build_deps, run_event_loop
+from backend.agents.coordinator_loop import build_deps, run_triage_loop
 from backend.config import Settings
 from backend.deps import CoordinatorDeps
+from backend.output_types import SemgrepFinding
+from backend.prompts import build_coordinator_prompt
 
 logger = logging.getLogger(__name__)
 
-COORDINATOR_PROMPT = """\
-You are a CTF competition coordinator running for the ENTIRE duration of a live competition.
-Your job is to maximize the number of challenges solved.
-
-Strategy:
-- Spawn swarms for unsolved challenges, prioritizing by solve count (easy first)
-- Use read_solver_trace to monitor what each solver is doing and where it's stuck
-- When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
-- Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
-
-CRITICAL RULES:
-- NEVER kill a swarm. Solvers will keep trying indefinitely with different approaches.
-  Even when stuck, they often unstick themselves after several bumps. Your job is to
-  HELP them, not give up on them. The only time a swarm should die is when the flag
-  is confirmed correct.
-- When a solver seems stuck, bump it with very specific technical guidance based on
-  its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
-- Cost is not a concern. Keep all swarms running.
-
-You will receive event messages. Respond with tool calls to manage the competition.
-"""
-
 
 def _text(s: str) -> dict:
-    """Wrap a string in the Claude SDK MCP tool return format."""
     return {"content": [{"type": "text", "text": s}]}
 
 
 def _build_coordinator_mcp(deps: CoordinatorDeps):
-    """Build MCP server — thin wrappers around coordinator_core functions."""
+    """Build MCP server with triage coordinator tools."""
 
-    @tool("fetch_challenges", "List all challenges with category, points, solve count, and status.", {})
-    async def fetch_challenges(args: dict) -> dict:
-        return _text(await do_fetch_challenges(deps))
+    @tool("get_triage_status", "List all findings with their current triage status.", {})
+    async def get_triage_status(args: dict) -> dict:
+        return _text(await do_get_triage_status(deps))
 
-    @tool("get_solve_status", "Check which challenges are solved and which swarms are running.", {})
-    async def get_solve_status(args: dict) -> dict:
-        return _text(await do_get_solve_status(deps))
-
-    @tool("spawn_swarm", "Launch all solver models on a challenge.", {"challenge_name": str})
+    @tool("spawn_swarm", "Launch solvers to triage a finding.", {"finding_id": str})
     async def spawn_swarm(args: dict) -> dict:
-        return _text(await do_spawn_swarm(deps, args["challenge_name"]))
+        return _text(await do_spawn_swarm(deps, args["finding_id"]))
 
-    @tool("check_swarm_status", "Get per-agent progress for a swarm.", {"challenge_name": str})
-    async def check_swarm_status(args: dict) -> dict:
-        return _text(await do_check_swarm_status(deps, args["challenge_name"]))
-
-    @tool("submit_flag", "Submit a flag to CTFd.", {"challenge_name": str, "flag": str})
-    async def submit_flag(args: dict) -> dict:
-        return _text(await do_submit_flag(deps, args["challenge_name"], args["flag"]))
-
-    @tool("kill_swarm", "Cancel all agents for a challenge.", {"challenge_name": str})
+    @tool("kill_swarm", "Cancel all solvers for a finding.", {"finding_id": str})
     async def kill_swarm(args: dict) -> dict:
-        return _text(await do_kill_swarm(deps, args["challenge_name"]))
+        return _text(await do_kill_swarm(deps, args["finding_id"]))
 
-    @tool("bump_agent", "Send targeted insights to a stuck agent.", {"challenge_name": str, "model_spec": str, "insights": str})
-    async def bump_agent(args: dict) -> dict:
-        return _text(await do_bump_agent(deps, args["challenge_name"], args["model_spec"], args["insights"]))
+    @tool("bump_solver", "Send targeted insights to a stuck solver.", {"finding_id": str, "model_spec": str, "insights": str})
+    async def bump_solver(args: dict) -> dict:
+        return _text(await do_bump_solver(deps, args["finding_id"], args["model_spec"], args["insights"]))
 
-    @tool("broadcast", "Broadcast a strategic hint to ALL solvers on a challenge.", {"challenge_name": str, "message": str})
+    @tool("broadcast", "Broadcast a hint to all solvers on a finding.", {"finding_id": str, "message": str})
     async def broadcast(args: dict) -> dict:
-        return _text(await do_broadcast(deps, args["challenge_name"], args["message"]))
+        return _text(await do_broadcast(deps, args["finding_id"], args["message"]))
 
-    @tool("read_solver_trace", "Read recent trace events from a specific solver. Use this to understand what a solver is doing, what it tried, and where it's stuck.", {"challenge_name": str, "model_spec": str, "last_n": int})
+    @tool("read_solver_trace", "Read recent trace events from a solver.", {"finding_id": str, "model_spec": str, "last_n": int})
     async def read_solver_trace(args: dict) -> dict:
-        return _text(await do_read_solver_trace(deps, args["challenge_name"], args["model_spec"], args.get("last_n", 20)))
+        return _text(await do_read_solver_trace(deps, args["finding_id"], args["model_spec"], args.get("last_n", 20)))
 
     return create_sdk_mcp_server(
         name="coordinator", version="1.0.0",
-        tools=[fetch_challenges, get_solve_status, spawn_swarm, check_swarm_status,
-               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace],
+        tools=[get_triage_status, spawn_swarm, kill_swarm, bump_solver, broadcast, read_solver_trace],
     )
 
 
 async def run_claude_coordinator(
     settings: Settings,
+    findings: list[SemgrepFinding],
+    target_dir: str,
     model_specs: list[str] | None = None,
-    challenges_root: str = "challenges",
-    no_submit: bool = False,
     coordinator_model: str | None = None,
     msg_port: int = 0,
 ) -> dict[str, Any]:
-    """Run the Claude Agent SDK coordinator with the shared event loop."""
-    ctfd, cost_tracker, deps = build_deps(
-        settings, model_specs, challenges_root, no_submit,
-    )
+    """Run the Claude Agent SDK coordinator over the findings queue."""
+    cost_tracker, deps = build_deps(settings, findings, target_dir, model_specs)
     deps.msg_port = msg_port
 
     mcp_server = _build_coordinator_mcp(deps)
     resolved_model = coordinator_model or "claude-opus-4-6"
+    system_prompt = build_coordinator_prompt(len(findings))
 
     allowed = {
-        "mcp__coordinator__fetch_challenges", "mcp__coordinator__get_solve_status",
-        "mcp__coordinator__spawn_swarm", "mcp__coordinator__check_swarm_status",
-        "mcp__coordinator__submit_flag", "mcp__coordinator__kill_swarm",
-        "mcp__coordinator__bump_agent", "mcp__coordinator__broadcast",
+        "mcp__coordinator__get_triage_status",
+        "mcp__coordinator__spawn_swarm",
+        "mcp__coordinator__kill_swarm",
+        "mcp__coordinator__bump_solver",
+        "mcp__coordinator__broadcast",
         "mcp__coordinator__read_solver_trace",
         "ToolSearch",
         "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
@@ -135,20 +98,20 @@ async def run_claude_coordinator(
     async def enforce_allowlist(input_data, tool_use_id, context):
         if input_data.get("hook_event_name") != "PreToolUse":
             return {}
-        tool = input_data.get("tool_name", "")
-        if tool in allowed:
+        t = input_data.get("tool_name", "")
+        if t in allowed:
             return {}
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"{tool} not available to coordinator.",
+                "permissionDecisionReason": f"{t} not available to coordinator.",
             }
         }
 
     options = ClaudeAgentOptions(
         model=resolved_model,
-        system_prompt=COORDINATOR_PROMPT,
+        system_prompt=system_prompt,
         env={"CLAUDECODE": ""},
         mcp_servers={"coordinator": mcp_server},
         allowed_tools=list(allowed),
@@ -160,18 +123,19 @@ async def run_claude_coordinator(
 
     async with ClaudeSDKClient(options=options) as client:
         async def turn_fn(msg: str) -> None:
-            logger.debug(f"Coordinator query: {msg[:200]}")
+            logger.debug("Coordinator query: %s", msg[:200])
             await client.query(msg)
             msg_count = 0
             async for message in client.receive_response():
                 msg_count += 1
-                msg_type = type(message).__name__
-                logger.debug(f"Coordinator received: {msg_type}")
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0)
                     session = getattr(message, "session_id", None)
-                    logger.info(f"Claude coordinator turn done (messages={msg_count}, cost=${cost:.4f}, session={session})")
+                    logger.info(
+                        "Coordinator turn done (messages=%d, cost=$%.4f, session=%s)",
+                        msg_count, cost, session,
+                    )
             if msg_count == 0:
                 logger.warning("Coordinator turn produced no messages!")
 
-        return await run_event_loop(deps, ctfd, cost_tracker, turn_fn)
+        return await run_triage_loop(deps, cost_tracker, turn_fn)

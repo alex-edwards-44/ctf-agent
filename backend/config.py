@@ -6,12 +6,6 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # CTFd
-    ctfd_url: str = "http://localhost:8000"
-    ctfd_user: str = "admin"
-    ctfd_pass: str = "admin"
-    ctfd_token: str = ""
-
     # API Keys
     anthropic_api_key: str = ""
     openai_api_key: str = ""
@@ -25,14 +19,13 @@ class Settings(BaseSettings):
     opencode_zen_api_key: str = ""
 
     # Infra
-    sandbox_image: str = "ctf-sandbox"
-    max_concurrent_challenges: int = 10
-    max_attempts_per_challenge: int = 3
-    container_memory_limit: str = "16g"
+    sandbox_image: str = "vuln-sandbox"
+    max_concurrent_findings: int = 4
+    container_memory_limit: str = "8g"
 
     # STRATEGY: per-solver step budget (0 = unlimited)
-    max_solver_steps: int = 40
+    max_solver_steps: int = 30
     # STRATEGY: total run cost ceiling in USD (0.0 = unlimited)
-    budget_usd: float = 5.0
+    budget_usd: float = 10.0
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

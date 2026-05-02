@@ -1,4 +1,4 @@
-"""Docker sandbox for CTF challenge solving — native async via aiodocker."""
+"""Docker sandbox for vuln-triage solver agents — native async via aiodocker."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import aiodocker
 
 logger = logging.getLogger(__name__)
 
-CONTAINER_LABEL = "ctf-agent"
+CONTAINER_LABEL = "vuln-triage"
 
 # Concurrency control
 _start_semaphore: asyncio.Semaphore | None = None
@@ -47,7 +47,7 @@ async def _track_stop() -> None:
 
 
 async def cleanup_orphan_containers() -> None:
-    """Kill any leftover ctf-agent containers from a previous run."""
+    """Kill any leftover vuln-triage containers from a previous run."""
     try:
         docker = aiodocker.Docker()
         try:
@@ -77,11 +77,17 @@ class ExecResult:
 
 @dataclass
 class DockerSandbox:
-    """Isolated Docker container for a single solver agent."""
+    """Isolated Docker container for a single solver agent.
+
+    For vuln-triage: set target_dir and finding_json_path.
+    The container runs with --network none (no outbound access).
+    """
 
     image: str
-    challenge_dir: str
-    memory_limit: str = "16g"
+    target_dir: str = ""           # host path to target repo → /target:ro
+    finding_json_path: str = ""    # host path to finding JSON → /finding.json:ro
+    memory_limit: str = "8g"
+    no_network: bool = True
     workspace_dir: str = ""
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
@@ -89,7 +95,6 @@ class DockerSandbox:
 
     @property
     def container_id(self) -> str:
-        """The Docker container ID, available after start()."""
         if not self._container:
             raise RuntimeError("Sandbox not started")
         return self._container.id
@@ -110,34 +115,38 @@ class DockerSandbox:
         sem = _start_semaphore or asyncio.Semaphore(50)
         async with sem:
             self._docker = aiodocker.Docker()
+            self.workspace_dir = tempfile.mkdtemp(prefix="vuln-workspace-")
 
-            self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
+            binds: list[str] = [f"{self.workspace_dir}:/workspace:rw"]
 
-            challenge_root = Path(self.challenge_dir).resolve()
-            distfiles = str(challenge_root / "distfiles")
-            meta_yml = str(challenge_root / "metadata.yml")
+            if self.target_dir:
+                target_root = Path(self.target_dir).resolve()
+                binds.append(f"{target_root}:/target:ro")
 
-            binds: list[str] = [f"{self.workspace_dir}:/challenge/workspace:rw"]
-            if Path(distfiles).exists():
-                binds.append(f"{distfiles}:/challenge/distfiles:ro")
-            if Path(meta_yml).exists():
-                binds.append(f"{meta_yml}:/challenge/metadata.yml:ro")
+            if self.finding_json_path:
+                finding_path = Path(self.finding_json_path).resolve()
+                binds.append(f"{finding_path}:/finding.json:ro")
+
+            host_config: dict = {
+                "Binds": binds,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges:true"],
+                "Memory": self._parse_memory_limit(),
+                "NanoCpus": int(2 * 1e9),
+            }
+
+            if self.no_network:
+                host_config["NetworkMode"] = "none"
+            else:
+                host_config["ExtraHosts"] = ["host.docker.internal:host-gateway"]
 
             config = {
                 "Image": self.image,
                 "Cmd": ["sleep", "infinity"],
-                "WorkingDir": "/challenge",
+                "WorkingDir": "/target",
                 "Tty": False,
                 "Labels": {CONTAINER_LABEL: "true"},
-                "HostConfig": {
-                    "Binds": binds,
-                    "ExtraHosts": ["host.docker.internal:host-gateway"],
-                    "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
-                    "SecurityOpt": ["seccomp=unconfined"],
-                    "Devices": [{"PathOnHost": "/dev/loop-control", "PathInContainer": "/dev/loop-control", "CgroupPermissions": "rwm"}],
-                    "Memory": self._parse_memory_limit(),
-                    "NanoCpus": int(2 * 1e9),
-                },
+                "HostConfig": host_config,
             }
 
             self._container = await self._docker.containers.create(config)
@@ -156,12 +165,9 @@ class DockerSandbox:
             try:
                 return await self._exec_inner(command, timeout_s)
             except aiodocker.exceptions.DockerError as e:
-                # Container was deleted (e.g., sibling solver found the flag)
                 return ExecResult(exit_code=-1, stdout="", stderr=f"Container gone: {e}")
 
     async def _exec_inner(self, command: str, timeout_s: int) -> ExecResult:
-        # Wrap command with `timeout` so the container kills the process on expiry.
-        # --signal=KILL ensures hard kill; --kill-after=5 is a safety net.
         wrapped = f"timeout --signal=KILL --kill-after=5 {timeout_s} bash -c {shlex.quote(command)}"
         exec_instance = await self._container.exec(
             cmd=["bash", "-c", wrapped],
@@ -185,7 +191,6 @@ class DockerSandbox:
                     stderr_chunks.append(msg.data)
 
         try:
-            # Give extra margin beyond the container-side timeout
             await asyncio.wait_for(_collect(), timeout=timeout_s + 30)
         except TimeoutError:
             try:
@@ -208,10 +213,8 @@ class DockerSandbox:
         )
 
     async def read_file(self, path: str) -> str | bytes:
-        """Read a file from the container. Returns str for text, bytes for binary."""
         if not self._container:
             raise RuntimeError("Sandbox not started")
-
         try:
             tar = await asyncio.wait_for(
                 self._container.get_archive(path),
@@ -220,7 +223,6 @@ class DockerSandbox:
         except TimeoutError as e:
             raise TimeoutError(f"Timed out reading {path}") from e
 
-        # aiodocker 0.26.0 returns tarfile.TarFile directly
         with tar:
             for member in tar:
                 if member.isfile():
@@ -234,27 +236,22 @@ class DockerSandbox:
         raise FileNotFoundError(f"No file found at {path}")
 
     async def read_file_bytes(self, path: str) -> bytes:
-        """Read a file from the container as raw bytes."""
         result = await self.read_file(path)
         if isinstance(result, str):
             return result.encode("utf-8")
         return result
 
     async def write_file(self, path: str, content: str | bytes) -> None:
-        """Write a file into the container via tar archive."""
         if not self._container:
             raise RuntimeError("Sandbox not started")
-
         if isinstance(content, str):
             content = content.encode("utf-8")
-
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             info = tarfile.TarInfo(name=Path(path).name)
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))
         buf.seek(0)
-
         try:
             await asyncio.wait_for(
                 self._container.put_archive(str(Path(path).parent), buf.getvalue()),
@@ -264,7 +261,6 @@ class DockerSandbox:
             raise TimeoutError(f"Timed out writing {path}") from e
 
     async def copy_from(self, container_path: str, host_path: str) -> None:
-        """Copy a file from the container to the host."""
         data = await self.read_file_bytes(container_path)
         Path(host_path).parent.mkdir(parents=True, exist_ok=True)
         Path(host_path).write_bytes(data)

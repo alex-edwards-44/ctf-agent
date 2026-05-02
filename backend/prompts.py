@@ -1,181 +1,105 @@
-"""System prompt builder + ChallengeMeta."""
+"""Prompt builders for vuln-triage solver and coordinator."""
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+import json
+from typing import TYPE_CHECKING
 
-import yaml
-
-from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
+if TYPE_CHECKING:
+    from backend.output_types import SemgrepFinding
 
 
-@dataclass
-class ChallengeMeta:
-    name: str = "Unknown"
-    category: str = ""
-    value: int = 0
-    description: str = ""
-    tags: list[str] = field(default_factory=list)
-    connection_info: str = ""
-    hints: list[dict[str, Any]] = field(default_factory=list)
-    solves: int = 0
+def build_solver_prompt(finding: "SemgrepFinding") -> str:
+    """System prompt for a solver triaging a single Semgrep finding."""
+    finding_summary = json.dumps(
+        {
+            "finding_id": finding.finding_id,
+            "rule_id": finding.rule_id,
+            "severity": finding.severity,
+            "path": finding.path,
+            "line": finding.line,
+            "cwe": finding.cwe,
+            "message": finding.message,
+            "code_snippet": finding.code_snippet,
+        },
+        indent=2,
+    )
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> ChallengeMeta:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        return cls(
-            name=data.get("name", "Unknown"),
-            category=data.get("category", ""),
-            value=data.get("value", 0),
-            description=data.get("description", ""),
-            tags=data.get("tags", []),
-            connection_info=data.get("connection_info", ""),
-            hints=data.get("hints", []),
-            solves=data.get("solves", 0),
-        )
+    return f"""\
+You are a security analyst investigating a single vulnerability finding produced by Semgrep.
+Your job is to determine whether this is a real vulnerability, a likely vulnerability, uncertain, or a false positive.
+
+The full source code is mounted read-only at /target. The specific finding is at /finding.json.
+Read both, then investigate.
+
+## Finding Summary
+
+```json
+{finding_summary}
+```
+
+## Investigation Process
+
+1. Read /finding.json for the full finding details.
+2. Read the flagged file at /target/{finding.path} (especially lines around line {finding.line}).
+3. Read the surrounding context:
+   - Functions that CALL the flagged code
+   - Functions that the flagged code CALLS
+   - Where untrusted input flows from (user input, HTTP params, env vars, CLI args)
+4. Check whether the dangerous code path is actually reachable in real usage
+   (vs only test/dev/scaffolding code).
+5. Look for sanitization or validation that Semgrep may have missed.
+6. When relevant, attempt to construct a PoC: a code snippet, curl command, or test input
+   that would trigger the vulnerability.
+
+## Available Tools
+
+All work runs inside this container. Use bash for everything:
+- `cat`, `head`, `tail` — read files
+- `grep`, `rg` (ripgrep) — search across the codebase
+- `ast-grep` — AST-aware code search
+- `find` — locate files
+- `jq` — parse JSON
+- `python3`, `node` — run scripts
+- `semgrep` — re-run Semgrep on specific files or with different rules
+
+## Submitting Your Verdict
+
+When you have finished your investigation, call:
+
+```
+submit_triage '{{"verdict": "...", "confidence": 0.0, "reasoning": "...", "exploitability": "...", "proof_of_concept": null, "remediation": null}}'
+```
+
+- `verdict`: one of `confirmed` | `likely` | `uncertain` | `false_positive`
+- `confidence`: 0.0 to 1.0
+- `reasoning`: 2-4 sentences explaining your verdict
+- `exploitability`: `trivial` | `moderate` | `difficult` | `n/a`
+- `proof_of_concept`: code/commands demonstrating the issue, or null
+- `remediation`: brief fix suggestion, or null
+
+**Be honest about uncertainty.** "uncertain" is a valid and useful verdict when:
+- The code is too complex to fully evaluate
+- Reachability depends on deployment context you can't see
+- Sanitization is plausible but not verifiable
+
+Do NOT force a confirmed/false_positive verdict if you genuinely can't tell.
+Do NOT guess. Investigate thoroughly, then submit once.
+"""
 
 
-def list_distfiles(challenge_dir: str) -> list[str]:
-    dist = Path(challenge_dir) / "distfiles"
-    if not dist.exists():
-        return []
-    return sorted(f.name for f in dist.iterdir() if f.is_file())
+def build_coordinator_prompt(n_findings: int) -> str:
+    """System prompt for the triage coordinator."""
+    return f"""\
+You are a vulnerability triage coordinator. You have {n_findings} finding(s) from Semgrep to triage.
 
+Your job is to:
+1. Spawn swarms in priority order (severity descending: ERROR → WARNING → INFO).
+2. Fan out across findings up to the concurrency limit.
+3. Stop when all findings are triaged or the budget is hit.
 
-def _rewrite_connection_info(conn: str) -> str:
-    """Replace localhost/127.0.0.1 with host.docker.internal for bridge networking."""
-    if not conn:
-        return conn
-    conn = re.sub(r"\blocalhost\b", "host.docker.internal", conn)
-    conn = re.sub(r"\b127\.0\.0\.1\b", "host.docker.internal", conn)
-    return conn
+Use `read_solver_trace` to monitor stuck solvers and `bump_solver` to provide targeted guidance.
+Use `get_triage_status` to check overall progress.
 
-
-def build_prompt(
-    meta: ChallengeMeta,
-    distfile_names: list[str],
-    container_arch: str = "unknown",
-    has_named_tools: bool = True,
-) -> str:
-    """Build the system prompt.
-
-    has_named_tools: True for Pydantic AI solver (has view_image, webhook_create, etc.
-    as discrete tools). False for Claude SDK (bash-only — model should use
-    steghide/exiftool/curl instead). Codex has named dynamic tools so uses True.
-    """
-    conn_info = _rewrite_connection_info(meta.connection_info.strip())
-
-    lines: list[str] = [
-        "You are an expert CTF solver. Find the real flag for the challenge below.",
-        "",
-    ]
-
-    if conn_info:
-        lines += [
-            "> **FIRST ACTION REQUIRED**: Your very first tool call MUST connect to the service.",
-            f"> Run: `{conn_info}` (use a heredoc or pwntools script as shown below).",
-            "> Do NOT explore the sandbox filesystem first. The flag is on the service, not in the container.",
-            "",
-        ]
-
-    lines += [
-        "## Challenge",
-        f"**Name**    : {meta.name}",
-        f"**Category**: {meta.category or 'Unknown'}",
-        f"**Points**  : {meta.value or '?'}",
-        f"**Arch**    : {container_arch}",
-    ]
-    if meta.tags:
-        lines.append(f"**Tags**    : {', '.join(meta.tags)}")
-    lines += ["", "## Description", meta.description or "_No description provided._", ""]
-
-    if conn_info:
-        if re.match(r"^https?://", conn_info):
-            hint = "This is a **web service**. Use `bash` with `curl`/`python3 requests`, or use `web_fetch`."
-        elif conn_info.startswith("nc "):
-            hint = (
-                "This is a **TCP service**. Each `bash` call is a fresh process — "
-                "use a heredoc to send multiple lines in one shot:\n"
-                "```\n"
-                f"{conn_info} <<'EOF'\ncommand1\ncommand2\nEOF\n"
-                "```\n"
-                "Or write a Python `socket` / `pwntools` script for stateful interaction."
-            )
-        else:
-            hint = "Connect using the details above."
-        lines += ["## Service Connection", "```", conn_info, "```", hint, ""]
-
-    if distfile_names:
-        lines.append("## Attached Files")
-        for name in distfile_names:
-            ext = Path(name).suffix.lower()
-            is_img = ext in IMAGE_EXTS
-            if is_img and has_named_tools:
-                suffix = "  <- **IMAGE: call `view_image` immediately** (fix magic bytes first if corrupt)"
-            elif is_img:
-                suffix = "  <- **IMAGE: use `exiftool`, `steghide`, `zsteg`, `strings` via bash**"
-            else:
-                suffix = ""
-            lines.append(f"- `/challenge/distfiles/{name}`{suffix}")
-        lines.append("")
-
-    visible_hints = [h for h in meta.hints if h.get("content")]
-    if visible_hints:
-        lines.append("## Hints")
-        for h in visible_hints:
-            lines.append(f"- {h['content']}")
-        lines.append("")
-
-    # pyghidra is always installed in the sandbox — show for RE/pwn/misc categories
-    # or when distfiles contain binaries (non-text files)
-    cat_lower = (meta.category or "").lower()
-    if cat_lower in ("reverse", "reversing", "re", "pwn", "binary", "misc", ""):
-        lines += [
-            "## Binary Analysis",
-            "**pyghidra** is installed for decompilation. Use it via bash:",
-            "```python",
-            "import pyghidra",
-            "with pyghidra.open_program('/challenge/distfiles/binary') as flat_api:",
-            "    listing = flat_api.currentProgram.getListing()",
-            "    # Iterate functions, decompile, etc.",
-            "```",
-            "Also available: radare2 (`r2`), gdb, angr, capstone.",
-            "",
-        ]
-
-    if has_named_tools:
-        image_hint = "**Images: call `view_image` FIRST, before any other analysis.**"
-        web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `webhook_create`."
-        submit_hint = "**Verify every candidate with `submit_flag`** before reporting."
-    else:
-        image_hint = "**Images: use `exiftool`, `steghide`, `zsteg`, `strings`, `xxd` via bash.**"
-        web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `curl` to webhook.site."
-        submit_hint = "**Verify every candidate with `submit_flag '<flag>'`** (bash command) before reporting."
-
-    lines += [
-        "",
-        "## Instructions",
-        "**Use tools immediately. Do not describe — execute.**",
-        "",
-        "1. " + ("Connect to the service now." if conn_info else "Inspect distfiles now."),
-        "2. Keep using tools until you have the flag.",
-        "3. **Be creative and thorough** — try the obvious path, then explore further:",
-        "   - Hidden files, env vars, backup files, HTTP headers, error messages, timing, encoding tricks.",
-        f"   - {image_hint}",
-        f"   - {web_hint}",
-        (
-            "   - Crypto: identify algorithm, weak keys, nonce reuse, padding oracles. "
-            "For RSA: use `RsaCtfTool`, sage ECM, or `cado-nfs`."
-        ),
-        "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
-        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
-        f"5. {submit_hint}",
-        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
-        "7. Do not guess. Do not ask. Cover maximum surface area.",
-    ]
-
-    return "\n".join(lines)
+Keep running until all findings are triaged or you receive a budget-exceeded notice.
+"""

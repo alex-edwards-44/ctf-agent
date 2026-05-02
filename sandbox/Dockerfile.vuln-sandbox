@@ -1,0 +1,15 @@
+# Vulnerability triage sandbox image.
+# Build: docker build -f sandbox/Dockerfile.vuln-sandbox -t vuln-sandbox:latest .
+# (run from repo root so ctf-sandbox:latest is available as a base)
+
+FROM ctf-sandbox:latest
+
+# semgrep, ast-grep Python bindings, ripgrep
+RUN apt-get update && apt-get install -y ripgrep && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir semgrep ast-grep-py
+
+# jq is already in ctf-sandbox
+
+# Solver works against read-only /target and /finding.json mounts.
+# No network access at runtime (--network none passed by sandbox.py).
+WORKDIR /target

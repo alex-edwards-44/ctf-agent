@@ -1,4 +1,4 @@
-"""Shared coordinator event loop — used by both Claude SDK and Codex coordinators."""
+"""Triage coordinator event loop — manages the queue of Semgrep findings."""
 
 from __future__ import annotations
 
@@ -6,16 +6,14 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from pathlib import Path
 from typing import Any
 
 from backend.config import Settings
 from backend.cost_tracker import CostTracker
-from backend.ctfd import CTFdClient
 from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
-from backend.poller import CTFdPoller
-from backend.prompts import ChallengeMeta
+from backend.output_types import SemgrepFinding
+from backend.scanner import SEVERITY_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -25,128 +23,117 @@ TurnFn = Callable[[str], Coroutine[Any, Any, None]]
 
 def build_deps(
     settings: Settings,
+    findings: list[SemgrepFinding],
+    target_dir: str,
     model_specs: list[str] | None = None,
-    challenges_root: str = "challenges",
-    no_submit: bool = False,
-    challenge_dirs: dict[str, str] | None = None,
-    challenge_metas: dict[str, ChallengeMeta] | None = None,
-) -> tuple[CTFdClient, CostTracker, CoordinatorDeps]:
-    """Create CTFd client, cost tracker, and coordinator deps."""
-    ctfd = CTFdClient(
-        base_url=settings.ctfd_url,
-        token=settings.ctfd_token,
-        username=settings.ctfd_user,
-        password=settings.ctfd_pass,
-    )
+) -> tuple[CostTracker, CoordinatorDeps]:
+    """Create cost tracker and coordinator deps for a triage run."""
     cost_tracker = CostTracker()
     specs = model_specs or list(DEFAULT_MODELS)
-    Path(challenges_root).mkdir(parents=True, exist_ok=True)
 
     deps = CoordinatorDeps(
-        ctfd=ctfd,
         cost_tracker=cost_tracker,
         settings=settings,
+        findings=findings,
         model_specs=specs,
-        challenges_root=challenges_root,
-        no_submit=no_submit,
-        max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
-        challenge_dirs=challenge_dirs or {},
-        challenge_metas=challenge_metas or {},
-        # STRATEGY: thread strategy flags from Settings into deps
-        max_solver_steps=getattr(settings, "max_solver_steps", 40),
-        budget_usd=getattr(settings, "budget_usd", 5.0),
+        max_concurrent_findings=getattr(settings, "max_concurrent_findings", 4),
+        max_solver_steps=getattr(settings, "max_solver_steps", 30),
+        budget_usd=getattr(settings, "budget_usd", 10.0),
+    )
+    # Stash target_dir in deps for use by coordinator_core
+    deps.target_dir = target_dir  # type: ignore[attr-defined]
+
+    return cost_tracker, deps
+
+
+def _sort_findings(findings: list[SemgrepFinding]) -> list[SemgrepFinding]:
+    """Sort by severity descending (ERROR first), then CWE presence, then path."""
+    return sorted(
+        findings,
+        key=lambda f: (
+            SEVERITY_ORDER.get(f.severity, 99),
+            0 if f.cwe else 1,
+            f.path,
+            f.line,
+        ),
     )
 
-    # Pre-load already-pulled challenges
-    for d in Path(challenges_root).iterdir():
-        meta_path = d / "metadata.yml"
-        if meta_path.exists():
-            meta = ChallengeMeta.from_yaml(meta_path)
-            if meta.name not in deps.challenge_dirs:
-                deps.challenge_dirs[meta.name] = str(d)
-                deps.challenge_metas[meta.name] = meta
 
-    return ctfd, cost_tracker, deps
-
-
-async def run_event_loop(
+async def run_triage_loop(
     deps: CoordinatorDeps,
-    ctfd: CTFdClient,
     cost_tracker: CostTracker,
     turn_fn: TurnFn,
-    status_interval: int = 60,
+    status_interval: int = 30,
 ) -> dict[str, Any]:
-    """Run the shared coordinator event loop.
+    """Drive the triage queue from start to finish.
 
-    Args:
-        deps: Coordinator dependencies (shared state).
-        ctfd: CTFd client (for poller).
-        cost_tracker: Cost tracker.
-        turn_fn: Async function that sends a message to the coordinator LLM.
-        status_interval: Seconds between status updates.
+    Auto-spawns swarms for findings in priority order, up to max_concurrent.
+    Exits when all findings are triaged (or budget is hit).
     """
-    poller = CTFdPoller(ctfd=ctfd, interval_s=5.0)
-    await poller.start()
+    sorted_findings = _sort_findings(deps.findings)
+    n = len(sorted_findings)
 
-    # Start operator message HTTP endpoint
+    # Start operator message server
     msg_server = await _start_msg_server(deps.operator_inbox, deps.msg_port)
 
     logger.info(
-        "Coordinator starting: %d models, %d challenges, %d solved",
-        len(deps.model_specs),
-        len(poller.known_challenges),
-        len(poller.known_solved),
+        "Triage loop starting: %d finding(s), %d model(s), budget=$%.2f",
+        n, len(deps.model_specs), deps.budget_usd,
     )
 
-    unsolved = poller.known_challenges - poller.known_solved
+    summary = "\n".join(
+        f"  [{i+1}] {f.severity} {f.rule_id} @ {f.path}:{f.line} (id={f.finding_id})"
+        for i, f in enumerate(sorted_findings)
+    )
     initial_msg = (
-        f"CTF is LIVE. {len(poller.known_challenges)} challenges, "
-        f"{len(poller.known_solved)} solved.\n"
-        f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
-        # STRATEGY: instruct coordinator to prioritize lower-value (easier) challenges first
-        "Fetch challenges and spawn swarms for all unsolved. "
-        "STRATEGY: prioritize lower point-value challenges first for quick early wins."
+        f"You have {n} finding(s) to triage from Semgrep, listed in priority order "
+        f"(severity descending):\n{summary}\n\n"
+        f"Spawn swarms in this order up to the concurrency limit ({deps.max_concurrent_findings}). "
+        f"Stop when all findings are triaged or the budget is hit."
     )
 
     try:
         await turn_fn(initial_msg)
 
-        # Auto-spawn swarms for unsolved challenges if coordinator LLM didn't
-        await _auto_spawn_unsolved(deps, poller)
+        # Auto-spawn up to capacity
+        for finding in sorted_findings:
+            await _auto_spawn_one(deps, finding.finding_id)
 
         last_status = asyncio.get_event_loop().time()
 
         while True:
-            events = []
-            evt = await poller.get_event(timeout=5.0)
-            if evt:
-                events.append(evt)
-            events.extend(poller.drain_events())
+            # Check completion
+            all_done = all(f.finding_id in deps.results for f in sorted_findings)
+            if all_done:
+                logger.info("All findings triaged — triage loop complete")
+                break
 
-            # Auto-kill swarms for solved challenges
-            for evt in events:
-                if evt.kind == "challenge_solved" and evt.challenge_name in deps.swarms:
-                    swarm = deps.swarms[evt.challenge_name]
-                    if not swarm.cancel_event.is_set():
-                        swarm.kill()
-                        logger.info("Auto-killed swarm for: %s", evt.challenge_name)
+            # Check budget
+            if deps.budget_usd > 0 and cost_tracker.total_cost_usd >= deps.budget_usd:
+                logger.warning(
+                    "Budget $%.2f hit (spent $%.2f) — stopping triage loop",
+                    deps.budget_usd, cost_tracker.total_cost_usd,
+                )
+                break
+
+            await asyncio.sleep(2.0)
 
             parts: list[str] = []
-            for evt in events:
-                if evt.kind == "new_challenge":
-                    parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
-                    # Auto-spawn for new challenges
-                    await _auto_spawn_one(deps, evt.challenge_name)
-                elif evt.kind == "challenge_solved":
-                    parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
 
-            # Detect finished swarms
-            for name, task in list(deps.swarm_tasks.items()):
+            # Detect finished swarms, spawn next queued finding
+            for fid, task in list(deps.swarm_tasks.items()):
                 if task.done():
-                    parts.append(f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry.")
-                    deps.swarm_tasks.pop(name, None)
+                    result_info = deps.results.get(fid, {})
+                    verdict = result_info.get("verdict", "no verdict")
+                    parts.append(f"TRIAGE DONE: '{fid}' — verdict: {verdict}")
+                    deps.swarm_tasks.pop(fid, None)
+                    # Spawn next queued finding if any
+                    for finding in sorted_findings:
+                        if finding.finding_id not in deps.results and finding.finding_id not in deps.swarms:
+                            await _auto_spawn_one(deps, finding.finding_id)
+                            break
 
-            # Drain solver-to-coordinator messages
+            # Drain solver messages
             while True:
                 try:
                     solver_msg = deps.coordinator_inbox.get_nowait()
@@ -163,37 +150,35 @@ async def run_event_loop(
                 except asyncio.QueueEmpty:
                     break
 
-            # Periodic status update — only when there are active swarms or other events
+            # Periodic status
             now = asyncio.get_event_loop().time()
             if now - last_status >= status_interval:
                 last_status = now
-                active = [n for n, t in deps.swarm_tasks.items() if not t.done()]
-                solved_set = poller.known_solved
-                unsolved_set = poller.known_challenges - solved_set
+                active = [fid for fid, t in deps.swarm_tasks.items() if not t.done()]
+                done_count = len(deps.results)
                 status_line = (
-                    f"STATUS: {len(solved_set)} solved, {len(unsolved_set)} unsolved, "
-                    f"{len(active)} active swarms. Cost: ${cost_tracker.total_cost_usd:.2f}"
+                    f"STATUS: {done_count}/{n} triaged, "
+                    f"{len(active)} active swarms. "
+                    f"Cost: ${cost_tracker.total_cost_usd:.2f}"
                 )
-                # Only send to coordinator if there's something happening
                 if active or parts:
                     parts.append(status_line)
                 else:
-                    logger.info(f"Event -> coordinator: {status_line}")
+                    logger.info(status_line)
 
             if parts:
                 msg = "\n\n".join(parts)
-                logger.info("Event -> coordinator: %s", msg[:200])
+                logger.debug("Event → coordinator: %s", msg[:200])
                 await turn_fn(msg)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Coordinator shutting down...")
+        logger.info("Triage loop interrupted")
     except Exception as e:
-        logger.error("Coordinator fatal: %s", e, exc_info=True)
+        logger.error("Triage loop fatal: %s", e, exc_info=True)
     finally:
         if msg_server:
             msg_server.close()
             await msg_server.wait_closed()
-        await poller.stop()
         for swarm in deps.swarms.values():
             swarm.kill()
         for task in deps.swarm_tasks.values():
@@ -201,10 +186,6 @@ async def run_event_loop(
         if deps.swarm_tasks:
             await asyncio.gather(*deps.swarm_tasks.values(), return_exceptions=True)
         cost_tracker.log_summary()
-        try:
-            await ctfd.close()
-        except Exception:
-            pass
 
     return {
         "results": deps.results,
@@ -213,59 +194,39 @@ async def run_event_loop(
     }
 
 
-async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
-    """Auto-spawn a swarm for a single challenge if not already running."""
-    if challenge_name in deps.swarms:
+async def _auto_spawn_one(deps: CoordinatorDeps, finding_id: str) -> None:
+    """Spawn a swarm for finding_id if not already running and under capacity."""
+    if finding_id in deps.results:
+        return
+    if finding_id in deps.swarms:
         return
 
-    # STRATEGY: cost-aware early stopping — don't start new swarms past the budget
-    budget = getattr(deps, "budget_usd", 5.0)
+    # STRATEGY: cost-aware early stopping
+    budget = deps.budget_usd
     if budget > 0 and deps.cost_tracker.total_cost_usd >= budget:
         logger.warning(
-            "STRATEGY: budget $%.2f reached (spent $%.2f) — skipping swarm for '%s'",
-            budget, deps.cost_tracker.total_cost_usd, challenge_name,
+            "STRATEGY: budget $%.2f reached — skipping swarm for '%s'",
+            budget, finding_id,
         )
         return
 
     active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
-    if active >= deps.max_concurrent_challenges:
+    if active >= deps.max_concurrent_findings:
         return
+
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
-        result = await do_spawn_swarm(deps, challenge_name)
-        logger.info(f"Auto-spawn {challenge_name}: {result[:100]}")
+        result = await do_spawn_swarm(deps, finding_id)
+        logger.info("Auto-spawn %s: %s", finding_id, result[:100])
     except Exception as e:
-        logger.warning(f"Auto-spawn failed for {challenge_name}: {e}")
-
-
-async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
-    """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
-    unsolved = poller.known_challenges - poller.known_solved
-
-    # STRATEGY: sort by ascending point value so cheaper (easier) challenges are
-    # attempted first, securing early wins before tackling harder ones.
-    try:
-        stubs = await deps.ctfd.fetch_challenge_stubs()
-        value_map = {ch["name"]: ch.get("value", 0) for ch in stubs}
-        sorted_unsolved = sorted(unsolved, key=lambda n: (value_map.get(n, 0), n))
-        logger.info(
-            "STRATEGY: spawning in ascending point order: %s",
-            [(n, value_map.get(n, 0)) for n in sorted_unsolved],
-        )
-    except Exception as e:
-        logger.warning("Could not fetch point values for prioritization: %s — falling back to alphabetical", e)
-        sorted_unsolved = sorted(unsolved)
-
-    for name in sorted_unsolved:
-        await _auto_spawn_one(deps, name)
+        logger.warning("Auto-spawn failed for %s: %s", finding_id, e)
 
 
 async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:
-    """Start a tiny HTTP server that accepts operator messages via POST."""
+    """Start a tiny HTTP server for operator messages via POST."""
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            # Read HTTP request
             request_line = await asyncio.wait_for(reader.readline(), timeout=5)
             headers: dict[str, str] = {}
             while True:
@@ -289,11 +250,14 @@ async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Serv
 
                 inbox.put_nowait(message)
                 resp = json.dumps({"ok": True, "queued": message[:200]})
-                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+                writer.write(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode()
+                )
             else:
-                resp = json.dumps({"error": "POST with JSON body required", "usage": "POST {\"message\": \"...\"}"})
-                writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
-
+                resp = json.dumps({"error": "POST with JSON body required"})
+                writer.write(
+                    f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode()
+                )
             await writer.drain()
         except Exception:
             pass
@@ -303,8 +267,8 @@ async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Serv
     try:
         server = await asyncio.start_server(_handle, "127.0.0.1", port)
         actual_port = server.sockets[0].getsockname()[1]
-        logger.info(f"Operator message endpoint listening on http://127.0.0.1:{actual_port}")
+        logger.info("Operator message endpoint: http://127.0.0.1:%d", actual_port)
         return server
     except OSError as e:
-        logger.warning(f"Could not start operator message endpoint: {e}")
+        logger.warning("Could not start operator message endpoint: %s", e)
         return None
