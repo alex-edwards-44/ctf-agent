@@ -266,20 +266,35 @@ class DockerSandbox:
         Path(host_path).write_bytes(data)
 
     async def stop(self) -> None:
+        # Collect any CancelledError so cleanup always runs to completion,
+        # then re-raise at the end so the task is properly marked cancelled.
+        _cancelled: bool = False
+
         if self._container:
+            container = self._container
+            self._container = None
             try:
-                await self._container.delete(force=True)
+                await container.delete(force=True)
+            except asyncio.CancelledError:
+                _cancelled = True
             except Exception:
                 pass
-            self._container = None
-            await _track_stop()
+            try:
+                await _track_stop()
+            except asyncio.CancelledError:
+                _cancelled = True
+            except Exception:
+                pass
 
         if self._docker:
+            docker = self._docker
+            self._docker = None
             try:
-                await self._docker.close()
+                await docker.close()
+            except asyncio.CancelledError:
+                _cancelled = True
             except Exception:
                 pass
-            self._docker = None
 
         if self.workspace_dir:
             import shutil
@@ -288,4 +303,8 @@ class DockerSandbox:
             except Exception:
                 pass
             self.workspace_dir = ""
+
         logger.info("Sandbox stopped")
+
+        if _cancelled:
+            raise asyncio.CancelledError()

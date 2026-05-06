@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 DEFAULT_MODELS: list[str] = [
     "claude-sdk/claude-opus-4-6/medium",
     "claude-sdk/claude-opus-4-6/max",
-    "google/gemini-3-flash-preview",
+    "google/gemini-2.5-pro",
+    "openai/gpt-5.4",
 ]
 
 # Context window sizes (tokens)

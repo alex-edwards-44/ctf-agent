@@ -10,6 +10,8 @@ dependencies = [
     "boto3",
     "aiodocker",
     "claude-agent-sdk",
+    "google-genai",
+    "openai",
     "httpx",
     "pyyaml",
     "rich",

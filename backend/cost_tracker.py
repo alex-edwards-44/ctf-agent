@@ -18,6 +18,7 @@ PROVIDER_MAP: dict[str, str] = {
     "azure": "openai",
     "zen": "openai",
     "codex": "openai",
+    "openai": "openai",
     "google": "google",
 }
 
@@ -57,6 +58,26 @@ FALLBACK_PRICING: dict[str, dict[str, float]] = {
         "input": 0.15,
         "cached_input": 0.02,
         "output": 0.60,
+    },
+    "gemini-2.5-flash": {
+        "input": 0.15,
+        "cached_input": 0.037,
+        "output": 0.60,
+    },
+    "gemini-2.5-flash-preview": {
+        "input": 0.15,
+        "cached_input": 0.037,
+        "output": 0.60,
+    },
+    "gemini-2.5-pro": {
+        "input": 1.25,
+        "cached_input": 0.31,
+        "output": 10.00,
+    },
+    "gemini-2.5-pro-preview": {
+        "input": 1.25,
+        "cached_input": 0.31,
+        "output": 10.00,
     },
 }
 
