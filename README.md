@@ -1,13 +1,17 @@
 # vuln-triage
 
-Semgrep-driven vulnerability triage with a multi-model solver swarm.
+Semgrep-driven vulnerability triage with a multi-model solver swarm and verified exploitation.
 
 ![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue)
 ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
 ## What it does
 
-vuln-triage runs Semgrep against a GitHub repository or local directory, then dispatches each finding to a swarm of LLM solvers that investigate whether the flagged code is actually exploitable. Each solver has access to a network-isolated Docker sandbox containing a read-only copy of the target and a JSON description of the finding. Results are consolidated by a coordinator model and written to a structured markdown report with verdicts, confidence scores, proof-of-concept notes, and remediation suggestions. The whole pipeline is cost-bounded: you set a USD ceiling and the coordinator stops spawning new solvers once it is reached.
+vuln-triage runs Semgrep against a GitHub repository or local directory, then dispatches each finding to a swarm of LLM solvers that investigate whether the flagged code is actually exploitable. Each solver has access to a network-isolated Docker sandbox containing a read-only copy of the target and a JSON description of the finding. Results are consolidated by a coordinator model and written to a structured markdown report with verdicts, confidence scores, proof-of-concept notes, and remediation suggestions.
+
+Optionally, confirmed findings can be escalated to an **exploit phase**: a separate agent deploys the target application inside a dedicated sandbox and attempts to verify the vulnerability by actually running a proof-of-concept exploit against it.
+
+The whole pipeline is cost-bounded: you set separate USD ceilings for the triage and exploit phases, and the coordinator stops spawning new work once either limit is reached.
 
 ## Why this exists
 
@@ -19,11 +23,17 @@ Static analyzers produce a lot of noise. A tool like Semgrep can fire dozens of 
 target (GitHub URL or local path)
         │
         ▼
-  ┌─────────────┐
-  │   Semgrep   │  --config auto (fallback: p/security-audit)
-  └──────┬──────┘
-         │  list[SemgrepFinding]  (sorted ERROR → WARNING → INFO)
-         ▼
+  ┌─────────────────────────────┐
+  │   Semgrep (multi-pack)      │  p/security-audit, p/owasp-top-ten,
+  │                             │  p/cwe-top-25, p/secrets
+  └──────────────┬──────────────┘  (deduplicated by path+line+rule_id)
+                 │  list[SemgrepFinding]  (sorted ERROR → WARNING → INFO)
+                 │
+                 ▼  [optional: --triage-top-percent / --triage-threshold]
+          size-aware filter
+          (ERROR > WARNING > INFO, then OWASP CWEs, then file size)
+                 │
+                 ▼
   ┌──────────────────┐
   │   Coordinator    │  Claude Opus 4 — orchestrates the swarm
   │  (claude_sdk)    │  MCP tools: spawn_swarm, kill_swarm,
@@ -47,36 +57,49 @@ target (GitHub URL or local path)
   └──────────────────────────┬─────────────────────────────────────┘
                      │  TriageVerdict
                      ▼
-             ┌───────────────┐
-             │  report.md    │
-             └───────────────┘
+         ┌────────────────────────┐
+         │   [optional]           │  --exploit-mode verify
+         │   ExploitSolver        │  deploys app in exploit-sandbox,
+         │   (top N confirmed)    │  runs PoC, returns ExploitResult
+         └────────────┬───────────┘
+                      │
+                      ▼
+              ┌───────────────┐
+              │  report.md    │
+              └───────────────┘
 ```
 
-The coordinator runs in a Claude agent SDK loop. It receives findings sorted by priority and calls `spawn_swarm` for each one up to the concurrency limit. A swarm runs four solvers in parallel — two Claude instances (via the Claude Agent SDK), one Gemini, one OpenAI — each investigating the finding independently using Bash tools inside the sandbox. Solvers submit a triage verdict via `submit_triage '{...}'`; the first verdict in wins and cancels the rest. The coordinator polls swarm status, bumps solvers that stall, and collects verdicts. Once all findings are triaged or the budget is exhausted, control returns to the CLI, which generates the markdown report.
+**Triage phase**: the coordinator runs in a Claude agent SDK loop. It receives findings sorted by priority and calls `spawn_swarm` for each one up to the concurrency limit. A swarm runs four solvers in parallel — two Claude instances (via the Claude Agent SDK), one Gemini, one OpenAI — each investigating the finding independently using Bash tools inside the sandbox. Solvers submit a triage verdict via `submit_triage '{...}'`; the first verdict in wins and cancels the rest. Insights found by one solver are broadcast to peers via `FindingMessageBus`, reducing redundant exploration.
 
-Insights found by one solver (e.g., "the function is only reachable from admin routes") are broadcast to peers via `FindingMessageBus`, reducing redundant exploration.
+**Exploit phase** (optional, `--exploit-mode verify`): after triage completes, the top N confirmed findings are sent to `ExploitSolver` sequentially. Each solver deploys the target app inside a dedicated `exploit-sandbox` container (which includes Python, Node, Java, pip, npm, Maven, curl, chromium, and a framework-aware startup supervisor), constructs a minimal proof-of-concept exploit, runs it against `localhost`, and returns a structured `ExploitResult` with the exploit script, raw output, and a one-sentence evidence summary. Results appear as a "Verified Exploits" section at the top of the report.
 
 ## Requirements
 
 - Python 3.14+
 - [uv](https://docs.astral.sh/uv/) package manager
-- Docker (for the solver sandbox)
+- Docker (for the solver and exploit sandboxes)
 - Semgrep (`brew install semgrep` or `pip install semgrep`)
-- API keys: Anthropic (required), Google and OpenAI (required for full 4-model swarm; each is optional if you trim `DEFAULT_MODELS`)
+- API keys: Anthropic (required), Google and OpenAI (required for full 4-model swarm; optional if you trim `DEFAULT_MODELS`)
 
 ## Installation
 
-Clone the repository and build the sandbox image:
+Clone the repository:
 
 ```bash
 git clone https://github.com/your-org/vuln-triage
 cd vuln-triage
 ```
 
-Build the Docker sandbox image (extends `ctf-sandbox`; adds ripgrep, semgrep, ast-grep-py):
+Build the triage sandbox image:
 
 ```bash
 docker build -f sandbox/Dockerfile.vuln-sandbox -t vuln-sandbox .
+```
+
+Build the exploit sandbox image (needed for `--exploit-mode verify` or `suggest`):
+
+```bash
+docker build -f sandbox/Dockerfile.exploit -t exploit-sandbox .
 ```
 
 Install Python dependencies:
@@ -116,13 +139,43 @@ uv run vuln-triage https://github.com/owner/repo \
   --output results/triage.md
 ```
 
-Use a custom Semgrep rules file instead of the auto config:
+Use specific Semgrep rule packs instead of the default four:
 
 ```bash
 uv run vuln-triage https://github.com/owner/repo \
-  --semgrep-config rules/my-rules.yaml \
-  --max-solver-steps 60 \
-  -v
+  --semgrep-rules p/security-audit,p/secrets
+```
+
+Use a custom Semgrep rules file:
+
+```bash
+uv run vuln-triage https://github.com/owner/repo \
+  --semgrep-config rules/my-rules.yaml
+```
+
+Only triage the highest-priority findings when the scan is large:
+
+```bash
+uv run vuln-triage https://github.com/owner/repo \
+  --triage-threshold 50 \
+  --triage-top-percent 40
+# If >50 findings: triage the top 40%, skip the rest (they appear in the report)
+```
+
+Verify the top confirmed findings by actually running exploits:
+
+```bash
+uv run vuln-triage https://github.com/owner/repo \
+  --exploit-mode verify \
+  --exploit-top-n 5 \
+  --exploit-budget-usd 10.00
+```
+
+Get suggested PoC scripts without executing them:
+
+```bash
+uv run vuln-triage https://github.com/owner/repo \
+  --exploit-mode suggest
 ```
 
 Run against a local directory:
@@ -144,13 +197,20 @@ uv run vuln-triage-msg "focus on the SQL injection findings first" --port 9400
 | `<target>` | — | GitHub URL or local path |
 | `--max-concurrent` | 4 | Swarms running in parallel |
 | `--max-solver-steps` | 30 | Tool-call cap per solver (0 = unlimited) |
-| `--budget-usd` | 10.00 | Total API cost ceiling in USD (0 = unlimited) |
-| `--severity` | warning | Minimum Semgrep severity: error, warning, info, all |
+| `--budget-usd` | 10.00 | Triage phase cost ceiling in USD (0 = unlimited) |
+| `--severity` | warning | Minimum Semgrep severity: `error`, `warning`, `info`, `all` |
 | `--output` | report.md | Output path for the markdown report |
-| `--image` | vuln-sandbox | Docker image name for the solver sandbox |
+| `--image` | vuln-sandbox | Docker image name for the triage sandbox |
 | `--models` | see below | Model specs (repeatable) |
 | `--coordinator-model` | claude-opus-4-6 | Model for the coordinator agent |
-| `--semgrep-config` | auto | Custom Semgrep rules file or registry config |
+| `--semgrep-config` | — | Custom Semgrep rules file/registry config (overrides default multi-pack scan) |
+| `--semgrep-rules` | — | Comma-separated pack names, e.g. `p/security-audit,p/secrets` (overrides defaults, ignored if `--semgrep-config` is set) |
+| `--triage-threshold` | 100 | Finding count above which `--triage-top-percent` activates |
+| `--triage-top-percent` | 100 | Triage only the top N% of findings when count exceeds `--triage-threshold` |
+| `--exploit-mode` | none | `none` \| `suggest` \| `verify` |
+| `--exploit-top-n` | 0 (auto) | Confirmed findings to exploit (0 = 10% of confirmed, min 3, max 10) |
+| `--exploit-timeout-seconds` | 300 | Seconds per exploit attempt |
+| `--exploit-budget-usd` | 5.00 | Exploit phase cost ceiling in USD |
 | `--no-cleanup` | false | Keep the cloned repo after the run |
 | `--msg-port` | 0 (auto) | Port for operator messages to the coordinator |
 | `-v / --verbose` | false | Debug-level logging |
@@ -158,23 +218,44 @@ uv run vuln-triage-msg "focus on the SQL injection findings first" --port 9400
 ### Sample report excerpt
 
 ```markdown
-## Confirmed Vulnerabilities (2)
+## Verified Exploits (1)
 
-### 🔴 `generate_exam_links.py:41` · CWE-345: Insufficient Verification of Data Authenticity
+The following vulnerabilities were confirmed exploitable by the exploit solver.
 
-**Rule**: `unsigned-base64-pii-in-url`
+### 💥 `main.py:484` — `sqli`
+
+**Evidence**: UNION-based SQL injection on /listservices?category= successfully
+extracted all rows from the secret_stuff table.
+
+**Exploit script**:
+curl -s "http://127.0.0.1:4000/listservices?category=%27%20UNION%20SELECT%201%2Cname%2C%27secret%27%2Cdescription%20FROM%20secret_stuff--"
+
+**Output**:
+<td>My first secret</td><td>Second secret</td>...
+
+---
+
+## Confirmed Vulnerabilities (4)
+
+### 🔴 `main.py:329` · CWE-502: Deserialization of Untrusted Data
+
+**Rule**: `python.flask.security.insecure-deserialization.insecure-deserialization`
 **Severity**: ERROR
 **Exploitability**: 🔥 trivial
-**Confidence**: 95%
+**Confidence**: 99%
 
-**Verdict**: Student PII is base64-encoded without HMAC/signature and placed in URL
-query parameters, enabling trivial data exposure and identity forgery.
+**Verdict**: The /cookie Flask route directly deserializes attacker-controlled
+data with pickle.loads(b64decode(request.cookies["value"])). No integrity check
+is performed before unpickling, so any remote user can trigger RCE.
 
 **Proof of concept**:
-python3 -c "import base64,json;print(base64.b64encode(json.dumps({\"student_id\":
-\"FORGED_ID\",\"student_name\":\"Attacker\"}).encode()).decode())"
+python3 -c "import pickle,base64,os;
+class RCE:
+    def __reduce__(self): return (os.system,('id',))
+print(base64.b64encode(pickle.dumps(RCE())).decode())"
+# send result as Cookie: value=<payload>
 
-**Remediation**: Sign the vars payload with HMAC and verify the signature before trusting.
+**Remediation**: Replace pickle with JSON + HMAC-signed Flask sessions.
 ```
 
 ## Configuration
@@ -187,11 +268,9 @@ GEMINI_API_KEY=...             # required for google/* specs
 OPENAI_API_KEY=sk-...          # required for openai/* specs
 ```
 
-Keys are read from `.env` via pydantic-settings. If a key is missing and its provider is in the active model list, solver creation raises a `ValueError` at swarm spawn time and the run fails loudly (no silent skip). To run with fewer providers, pass `--models` explicitly to override `DEFAULT_MODELS`.
+Keys are read from `.env` via pydantic-settings. If a key is missing and its provider is in the active model list, solver creation raises a `ValueError` at swarm spawn time (no silent skip). To run with fewer providers, pass `--models` explicitly.
 
 ### Model lineup
-
-The default model specs passed to `--models` are:
 
 ```
 claude-sdk/claude-opus-4-6/medium   # ClaudeSolver via Claude Agent SDK
@@ -200,12 +279,10 @@ google/gemini-2.5-pro               # GeminiSolver via google-genai
 openai/gpt-5.4                      # OpenAISolver via openai SDK
 ```
 
-Each spec has the form `provider/model-id` (with an optional `/service-tier` suffix for `claude-sdk`). The coordinator always runs on `claude-opus-4-6` unless `--coordinator-model` overrides it.
-
-All three providers are genuinely implemented. Each finding gets all four solvers racing in parallel inside separate Docker containers; the first to submit a verdict wins. To use fewer providers, override via `--models`:
+Each spec has the form `provider/model-id` (with an optional `/service-tier` suffix for `claude-sdk`). To use fewer providers:
 
 ```bash
-# Claude only (two tiers)
+# Claude only
 uv run vuln-triage https://github.com/owner/repo \
   --models claude-sdk/claude-opus-4-6/medium \
   --models claude-sdk/claude-opus-4-6/max
@@ -217,37 +294,72 @@ uv run vuln-triage https://github.com/owner/repo \
 
 ## Sandbox model
 
-Each solver runs inside a Docker container created from the `vuln-sandbox` image. The container has:
+### Triage sandbox (`vuln-sandbox`)
+
+Each triage solver runs inside a Docker container with:
 
 - `/target` — read-only bind-mount of the cloned repository
-- `/finding.json` — read-only JSON describing the current finding (path, line, rule, message, code snippet, CWE)
-- `/workspace` — read-write tmpfs for scratch work
+- `/finding.json` — read-only JSON describing the current finding
+- `/workspace` — read-write scratch space
 - `NetworkMode: none` — no outbound or inbound network access
 - All Linux capabilities dropped; `no-new-privileges` set
 
-The solver's Bash tool is constrained to this container. It cannot make HTTP requests, cannot write to the target, and cannot persist state between runs. Container cleanup is guaranteed by a finally block in the swarm; orphaned containers (from a crashed run) are removed on the next startup via `cleanup_orphan_containers()`.
+### Exploit sandbox (`exploit-sandbox`)
 
-The coordinator runs outside the sandbox with network access, since it needs to call the model APIs. It does not execute attacker-controlled code.
+Each exploit attempt runs inside a separate container with:
+
+- `/target` — read-only bind-mount of the cloned repository
+- `/workspace` — read-write scratch space
+- `NetworkMode: none` — loopback (`127.0.0.1`) works for the app under test; no external access
+- Runtimes: Python 3, Node 20, Java 17 JRE, pip, npm, Maven
+- Tools: curl, jq, ripgrep, chromium (headless)
+- `run_target [framework|auto]` — framework-aware supervisor: detects Flask/FastAPI/Django/Express/Spring from package files, installs dependencies, binds to a free port, waits for the port to respond, and prints `APP_PORT=<port>`
+- `stop_target` — stops the previously started target process
+
+## Semgrep rule coverage
+
+By default, vuln-triage runs four Semgrep rule packs and merges results:
+
+| Pack | Focus |
+|------|-------|
+| `p/security-audit` | General security anti-patterns |
+| `p/owasp-top-ten` | OWASP Top 10 2021 |
+| `p/cwe-top-25` | CWE Top 25 Most Dangerous |
+| `p/secrets` | Hardcoded credentials and tokens |
+
+Findings are deduplicated by `(path, line, rule_id)`. Use `--semgrep-rules` to override the pack list or `--semgrep-config` to supply a local rules file.
+
+## Triage filtering
+
+When scans produce many findings, `--triage-threshold` and `--triage-top-percent` let you focus triage on the highest-priority subset:
+
+```
+--triage-threshold 100    # activate filtering when total > 100
+--triage-top-percent 40   # triage the top 40%, skip the rest
+```
+
+Priority ordering within the filter: severity (ERROR > WARNING > INFO) → OWASP Top 10 CWE presence → file size (smaller files first). Skipped findings are listed in the report under "Filtered Out" and are not lost — just not investigated by the LLM.
 
 ## Limitations
 
-- **Semgrep auto config requires a network connection and accepts Semgrep's telemetry.** If your policy prohibits this, supply your own rules with `--semgrep-config`.
-- **Custom rules are necessary for logic-level vulnerabilities.** Standard Semgrep rulesets target syntax patterns (SQL concatenation, command injection, hardcoded secrets). Vulnerabilities that require understanding data flow across multiple files — broken access control, insecure design, business logic flaws — will not be found without purpose-written rules.
-- **Claude has the most mature integration.** ClaudeSolver uses the Claude Agent SDK, which provides a persistent session, structured output schema, and PreToolUse/PostToolUse hook interception. GeminiSolver and OpenAISolver implement a manual function-calling loop that replays the full conversation history on every API call (no persistent session). This means Gemini and OpenAI pay the full context cost on each turn, while Claude's SDK can cache previous turns.
-- **Gemini free-tier rate limits.** The free tier is rate-limited to a small number of requests per minute. On a run with multiple concurrent findings, you will likely hit 429 errors from Gemini. The solver catches these as `QUOTA_ERROR` and stops cleanly, but the finding may end up triaged by Claude only. Use a paid key for reliable multi-provider operation.
-- **Parallel tool calls.** OpenAI may return multiple tool calls in one response (parallel function calling). GeminiSolver and OpenAISolver both handle this correctly, but step counting may differ slightly from ClaudeSolver since parallel calls count as one step in some providers.
-- **Prompt injection in target code.** If the repository under analysis contains text specifically crafted to manipulate LLM behavior, a solver may be influenced. The finding JSON and target are treated as untrusted data by the prompts, but this is best-effort, not a guarantee.
-- **Cost unpredictability.** The `--budget-usd` ceiling is checked before spawning new swarms; it does not interrupt a running swarm. A single swarm with four solvers can cost more than expected if all explore aggressively before hitting their step cap.
+- **Custom rules needed for logic-level vulnerabilities.** Standard Semgrep packs target syntax patterns. Broken access control, insecure design, and business logic flaws require purpose-written rules.
+- **Claude has the most mature integration.** GeminiSolver and OpenAISolver use a manual function-calling loop that replays full conversation history on every API call. ClaudeSolver uses the Claude Agent SDK with persistent sessions and turn-level caching.
+- **Gemini free-tier rate limits.** On runs with multiple concurrent findings you will likely see 429 errors from Gemini. The solver stops cleanly on quota errors; findings may be triaged by Claude only. Use a paid key for reliable multi-provider operation.
+- **`--budget-usd` does not interrupt a running swarm.** Budget is checked before spawning; a running four-solver swarm can overshoot the ceiling before it finishes.
+- **Exploit verification is Claude Opus only.** `ExploitSolver` uses `claude-opus-4-6` directly and is not part of the multi-model swarm.
+- **No live-target exploitation.** The exploit sandbox only ever targets the cloned repository running inside itself on `localhost`. URL-based exploitation of running services is not supported.
+- **Non-runtime findings return `verified=false`.** Hardcoded secrets in config files, weak crypto choices, and similar static findings have no runtime trigger; `ExploitSolver` reports a clear `failure_reason` rather than fabricating a result.
 - **No support for private repositories.** `RepoLoader` clones with `git clone --depth=1` and no authentication. For private repos, clone manually and pass the local path.
-- **Code snippets in reports show "requires login"** when using the Semgrep registry without an account. This is a Semgrep API limitation; it does not affect solver quality since solvers read `/target` directly.
+- **Code snippets in reports may show "requires login"** when using the Semgrep registry without an account. This is a Semgrep API limitation and does not affect solver quality since solvers read `/target` directly.
+- **Prompt injection in target code.** If the repository contains text crafted to manipulate LLM behavior, a solver may be influenced. This is best-effort mitigation, not a guarantee.
 
 ## Roadmap
 
 - Support SARIF output in addition to markdown
 - Add a `--recheck` flag that feeds a prior report back as context for a second-pass run
-- Explore structured output mode as the primary verdict channel (currently secondary to `submit_triage` interception)
-- Improve budget tracking granularity: per-swarm cost caps in addition to the global ceiling
+- Per-swarm cost caps in addition to the global ceiling
 - Add a web UI for browsing reports and replaying solver traces
+- Parallel exploit attempts (currently sequential to keep logs clean)
 
 ## Credits
 
