@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from backend.config import Settings
 from backend.models import DEFAULT_MODELS
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -50,7 +52,22 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--coordinator-model", default=None,
               help="Model for coordinator (default: claude-opus-4-6)")
 @click.option("--semgrep-config", default=None,
-              help="Custom Semgrep rules file or registry config (overrides auto)")
+              help="Custom Semgrep rules file or registry config (overrides default multi-pack scan)")
+@click.option("--semgrep-rules", default=None,
+              help="Comma-separated Semgrep rule packs to run (e.g. 'p/security-audit,p/owasp-top-ten')")
+@click.option("--triage-top-percent", default=100.0, type=float, show_default=True,
+              help="Triage only top N%% of findings when count exceeds --triage-threshold")
+@click.option("--triage-threshold", default=100, type=int, show_default=True,
+              help="Finding count above which --triage-top-percent activates")
+@click.option("--exploit-mode", default="none",
+              type=click.Choice(["none", "suggest", "verify"], case_sensitive=False),
+              show_default=True, help="Exploit verification mode")
+@click.option("--exploit-top-n", default=0, type=int, show_default=True,
+              help="Number of confirmed findings to attempt exploitation (0 = auto: 10%% of confirmed, min 3, max 10)")
+@click.option("--exploit-timeout-seconds", default=300, type=int, show_default=True,
+              help="Seconds per exploit attempt")
+@click.option("--exploit-budget-usd", default=5.0, type=float, show_default=True,
+              help="Max USD to spend on exploit verification phase")
 @click.option("--no-cleanup", is_flag=True,
               help="Don't delete the cloned repo at end (for debugging)")
 @click.option("--msg-port", default=0, type=int,
@@ -67,6 +84,13 @@ def main(
     models: tuple[str, ...],
     coordinator_model: str | None,
     semgrep_config: str | None,
+    semgrep_rules: str | None,
+    triage_top_percent: float,
+    triage_threshold: int,
+    exploit_mode: str,
+    exploit_top_n: int,
+    exploit_timeout_seconds: int,
+    exploit_budget_usd: float,
     no_cleanup: bool,
     msg_port: int,
     verbose: bool,
@@ -85,6 +109,13 @@ def main(
             model_specs=list(models) if models else list(DEFAULT_MODELS),
             coordinator_model=coordinator_model,
             semgrep_config=semgrep_config,
+            semgrep_rules=semgrep_rules,
+            triage_top_percent=triage_top_percent,
+            triage_threshold=triage_threshold,
+            exploit_mode=exploit_mode,
+            exploit_top_n=exploit_top_n,
+            exploit_timeout_seconds=exploit_timeout_seconds,
+            exploit_budget_usd=exploit_budget_usd,
             no_cleanup=no_cleanup,
             msg_port=msg_port,
         )
@@ -102,17 +133,35 @@ async def _run(
     model_specs: list[str],
     coordinator_model: str | None,
     semgrep_config: str | None,
+    semgrep_rules: str | None,
+    triage_top_percent: float,
+    triage_threshold: int,
+    exploit_mode: str,
+    exploit_top_n: int,
+    exploit_timeout_seconds: int,
+    exploit_budget_usd: float,
     no_cleanup: bool,
     msg_port: int,
 ) -> None:
     from backend.repo_loader import RepoLoader
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
-    from backend.scanner import run_semgrep
+    from backend.scanner import DEFAULT_PACKS, filter_findings, run_semgrep, run_semgrep_multi
 
     settings = Settings(sandbox_image=image)
     settings.max_concurrent_findings = max_concurrent
     settings.max_solver_steps = max_solver_steps
     settings.budget_usd = budget_usd
+
+    # Determine which packs will be used (for display and scanning)
+    if semgrep_config:
+        active_packs: list[str] | None = None
+        packs_display = f"custom config: {semgrep_config}"
+    elif semgrep_rules:
+        active_packs = [p.strip() for p in semgrep_rules.split(",") if p.strip()]
+        packs_display = ", ".join(active_packs)
+    else:
+        active_packs = None  # run_semgrep_multi defaults to DEFAULT_PACKS
+        packs_display = ", ".join(DEFAULT_PACKS)
 
     console.print("[bold]vuln-triage[/bold]")
     console.print(f"  Target:           {target}")
@@ -121,6 +170,9 @@ async def _run(
     console.print(f"  Max solver steps: {max_solver_steps if max_solver_steps > 0 else 'unlimited'}")
     console.print(f"  Budget:           {'$' + f'{budget_usd:.2f}' if budget_usd > 0 else 'unlimited'}")
     console.print(f"  Severity filter:  {severity}")
+    console.print(f"  Semgrep packs:    {packs_display}")
+    if exploit_mode != "none":
+        console.print(f"  Exploit mode:     {exploit_mode} (budget: ${exploit_budget_usd:.2f})")
     console.print(f"  Output:           {output}")
     console.print()
 
@@ -131,34 +183,45 @@ async def _run(
     local_path = loader._resolve()
 
     try:
-        # Step 1: Run Semgrep
+        # Step 1: Run Semgrep (multi-pack by default)
         console.print("[bold]Step 1: Running Semgrep...[/bold]")
         if semgrep_config:
             findings = run_semgrep(local_path, config=semgrep_config, severity_min=severity)
         else:
-            findings = run_semgrep(local_path, config="auto", severity_min=severity)
-            if not findings:
-                console.print("[yellow]No findings from --config=auto. Retrying with --config=p/security-audit...[/yellow]")
-                findings = run_semgrep(local_path, config="p/security-audit", severity_min=severity)
+            findings = run_semgrep_multi(local_path, configs=active_packs, severity_min=severity)
 
         if not findings:
             console.print("[yellow]No Semgrep findings. Nothing to triage.[/yellow]")
             _write_empty_report(output, target)
             return
 
-        console.print(f"[green]Found {len(findings)} finding(s) to triage.[/green]\n")
+        console.print(f"[green]Found {len(findings)} finding(s).[/green]")
         for i, f in enumerate(findings, 1):
             console.print(f"  [{i:3d}] {f.severity:7s}  {f.path}:{f.line}  ({f.rule_id})")
         console.print()
 
-        # Step 2: Triage
-        console.print("[bold]Step 2: Triaging findings...[/bold]\n")
+        # Step 2: Apply triage size filter
+        to_triage, skipped = filter_findings(
+            findings,
+            top_percent=triage_top_percent,
+            threshold=triage_threshold,
+            target_dir=local_path,
+        )
+        if skipped:
+            console.print(
+                f"[yellow]Filtering: triaging top {triage_top_percent:.0f}% of "
+                f"{len(findings)} findings = {len(to_triage)}. "
+                f"Skipping {len(skipped)} lower-severity findings.[/yellow]\n"
+            )
+
+        # Step 3: Triage
+        console.print(f"[bold]Step 2: Triaging {len(to_triage)} finding(s)...[/bold]\n")
 
         from backend.agents.claude_coordinator import run_claude_coordinator
 
         run_result = await run_claude_coordinator(
             settings=settings,
-            findings=findings,
+            findings=to_triage,
             target_dir=local_path,
             model_specs=model_specs,
             coordinator_model=coordinator_model,
@@ -168,11 +231,7 @@ async def _run(
         verdicts_raw = run_result.get("results", {})
         total_cost = run_result.get("total_cost_usd", 0.0)
 
-        # Step 3: Generate report
-        console.print("\n[bold]Step 3: Generating report...[/bold]")
-
         from backend.output_types import TriageVerdict
-        from backend.report import generate_report
 
         verdicts: dict[str, TriageVerdict] = {}
         for fid, data in verdicts_raw.items():
@@ -193,17 +252,40 @@ async def _run(
                 except Exception:
                     pass
 
+        # Step 4: Exploit phase (optional)
+        exploit_results: dict = {}
+        if exploit_mode != "none":
+            findings_map = {f.finding_id: f for f in to_triage}
+            exploit_results, exploit_cost = await _run_exploit_phase(
+                verdicts=verdicts,
+                findings_map=findings_map,
+                target_dir=local_path,
+                settings=settings,
+                exploit_mode=exploit_mode,
+                exploit_top_n=exploit_top_n,
+                exploit_timeout_seconds=exploit_timeout_seconds,
+                exploit_budget_usd=exploit_budget_usd,
+            )
+            total_cost += exploit_cost
+
+        # Step 5: Generate report
+        step_num = 5 if exploit_mode != "none" else 3
+        console.print(f"\n[bold]Step {step_num}: Generating report...[/bold]")
+
+        from backend.report import generate_report
+
         report_md = generate_report(
-            findings=findings,
+            findings=to_triage,
             verdicts=verdicts,
             target=target,
             total_cost_usd=total_cost,
+            skipped_findings=skipped or None,
+            exploit_results=exploit_results or None,
         )
 
         Path(output).write_text(report_md)
         console.print(f"[green]Report written to:[/green] {output}\n")
 
-        # Summary
         from collections import Counter
         counts = Counter(v.verdict for v in verdicts.values())
         console.print("[bold]Triage Summary:[/bold]")
@@ -211,11 +293,121 @@ async def _run(
         console.print(f"  Likely:         {counts.get('likely', 0)}")
         console.print(f"  Uncertain:      {counts.get('uncertain', 0)}")
         console.print(f"  False positive: {counts.get('false_positive', 0)}")
-        console.print(f"  Not triaged:    {len(findings) - len(verdicts)}")
+        console.print(f"  Not triaged:    {len(to_triage) - len(verdicts)}")
+        if skipped:
+            console.print(f"  Filtered out:   {len(skipped)}")
+        if exploit_results:
+            verified_n = sum(1 for r in exploit_results.values() if r.verified)
+            console.print(f"  Verified exploits: {verified_n}/{len(exploit_results)}")
         console.print(f"\n[bold]Total cost: ${total_cost:.2f}[/bold]")
 
     finally:
         loader.cleanup()
+
+
+async def _run_exploit_phase(
+    verdicts: dict,
+    findings_map: dict,
+    target_dir: str,
+    settings: Settings,
+    exploit_mode: str,
+    exploit_top_n: int,
+    exploit_timeout_seconds: int,
+    exploit_budget_usd: float,
+) -> tuple[dict, float]:
+    """Run exploit verification on top confirmed findings. Returns (exploit_results, total_cost)."""
+    from backend.cost_tracker import CostTracker
+    from backend.output_types import ExploitResult
+    from backend.scanner import SEVERITY_ORDER
+
+    confirmed = [v for v in verdicts.values() if v.verdict == "confirmed"]
+    if not confirmed:
+        console.print("[yellow]Exploit phase: no confirmed findings to exploit.[/yellow]")
+        return {}, 0.0
+
+    def _rank(v):
+        f = findings_map.get(v.finding_id)
+        sev = SEVERITY_ORDER.get(f.severity if f else "WARNING", 99)
+        has_cwe = 0 if (f and f.cwe) else 1
+        return (sev, has_cwe)
+
+    confirmed.sort(key=_rank)
+
+    num_confirmed = len(confirmed)
+    if exploit_top_n <= 0:
+        n = max(3, min(10, math.ceil(0.10 * num_confirmed))) if num_confirmed >= 3 else num_confirmed
+    else:
+        n = exploit_top_n
+    top_verdicts = confirmed[:n]
+
+    console.print(
+        f"\n[bold]Step 4: Exploit phase ({exploit_mode}) — "
+        f"top {n} of {num_confirmed} confirmed finding(s)...[/bold]\n"
+    )
+
+    cost_tracker = CostTracker()
+    exploit_results: dict[str, ExploitResult] = {}
+    exploit_spend = 0.0
+
+    for verdict in top_verdicts:
+        finding = findings_map.get(verdict.finding_id)
+        if not finding:
+            continue
+
+        if exploit_budget_usd > 0 and exploit_spend >= exploit_budget_usd:
+            console.print(
+                f"[yellow]Exploit budget ${exploit_budget_usd:.2f} reached — "
+                "stopping exploit phase.[/yellow]"
+            )
+            break
+
+        console.print(f"  Exploiting: {finding.path}:{finding.line}  ({finding.rule_id})")
+
+        if exploit_mode == "suggest":
+            result = ExploitResult(
+                finding_id=finding.finding_id,
+                verified=False,
+                exploit_type="suggested",
+                exploit_script=verdict.proof_of_concept or "",
+                failure_reason="suggest mode — PoC generated by triage, not executed",
+                cost_usd=0.0,
+            )
+        else:
+            from backend.agents.exploit_solver import ExploitSolver
+            solver = ExploitSolver(
+                finding=finding,
+                verdict=verdict,
+                target_dir=target_dir,
+                cost_tracker=cost_tracker,
+                settings=settings,
+                timeout_seconds=exploit_timeout_seconds,
+            )
+            try:
+                result = await solver.run()
+            except Exception as exc:
+                logger.error("ExploitSolver failed for %s: %s", finding.finding_id, exc)
+                result = ExploitResult(
+                    finding_id=finding.finding_id,
+                    verified=False,
+                    failure_reason=f"solver exception: {exc}",
+                    cost_usd=0.0,
+                )
+
+        exploit_results[finding.finding_id] = result
+        exploit_spend += result.cost_usd
+        status = (
+            "verified ✓"
+            if result.verified
+            else f"not verified ({(result.failure_reason or '')[:60]})"
+        )
+        console.print(f"    → {status}  (cost: ${result.cost_usd:.4f})")
+
+    verified_n = sum(1 for r in exploit_results.values() if r.verified)
+    console.print(
+        f"\n  Exploit phase complete: {verified_n}/{len(exploit_results)} verified "
+        f"(cost: ${cost_tracker.total_cost_usd:.2f})\n"
+    )
+    return exploit_results, cost_tracker.total_cost_usd
 
 
 def _write_empty_report(output: str, target: str) -> None:
