@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # Infra
     sandbox_image: str = "vuln-sandbox"
+    exploit_image: str = "exploit-sandbox"
     max_concurrent_findings: int = 4
     container_memory_limit: str = "8g"
 

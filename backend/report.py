@@ -6,7 +6,7 @@ import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from backend.output_types import SemgrepFinding, TriageVerdict
+    from backend.output_types import ExploitResult, SemgrepFinding, TriageVerdict
 
 # Verdict ordering for report sections
 VERDICT_ORDER = ["confirmed", "likely", "uncertain", "false_positive"]
@@ -69,8 +69,12 @@ def generate_report(
     verdicts: dict[str, "TriageVerdict"],
     target: str = "",
     total_cost_usd: float = 0.0,
+    skipped_findings: list["SemgrepFinding"] | None = None,
+    exploit_results: dict[str, "ExploitResult"] | None = None,
 ) -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    skipped = skipped_findings or []
+    exploits = exploit_results or {}
 
     # Build lookup map
     finding_map = {f.finding_id: f for f in findings}
@@ -96,6 +100,9 @@ def generate_report(
     total = len(findings)
     triaged = total - len(untriaged)
 
+    verified_exploits = [r for r in exploits.values() if r.verified]
+    failed_exploits = [r for r in exploits.values() if not r.verified]
+
     lines: list[str] = [
         "# Vulnerability Triage Report",
         "",
@@ -112,11 +119,43 @@ def generate_report(
         f"| ❓ Uncertain | {uncertain} |",
         f"| ✅ False Positive | {fp} |",
         f"| ⏭ Not triaged | {len(untriaged)} |",
-        f"| **Total** | **{total}** |",
+    ]
+    if skipped:
+        lines.append(f"| ⏩ Filtered out | {len(skipped)} |")
+    if verified_exploits:
+        lines.append(f"| 💥 Verified exploits | {len(verified_exploits)} |")
+    lines += [
+        f"| **Total** | **{total + len(skipped)}** |",
         "",
     ]
 
-    # Sections
+    # Verified exploits section (before triage sections for prominence)
+    if verified_exploits:
+        lines.append(f"## Verified Exploits ({len(verified_exploits)})")
+        lines.append("")
+        lines.append("The following vulnerabilities were confirmed exploitable by the exploit solver.")
+        lines.append("")
+        for er in verified_exploits:
+            finding = finding_map.get(er.finding_id)
+            loc = f"`{finding.path}:{finding.line}`" if finding else f"`{er.finding_id}`"
+            lines.append(f"### 💥 {loc} — `{er.exploit_type or 'unknown'}`")
+            lines.append("")
+            if er.evidence:
+                lines.append(f"**Evidence**: {er.evidence}")
+                lines.append("")
+            if er.exploit_script:
+                lines.append(f"**Exploit script**:\n```\n{er.exploit_script}\n```")
+                lines.append("")
+            if er.exploit_output:
+                lines.append(f"**Output**:\n```\n{er.exploit_output[:2000]}\n```")
+                lines.append("")
+            if er.cost_usd:
+                lines.append(f"*Exploit cost: ${er.cost_usd:.4f}*")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Triage sections
     for verdict_key in VERDICT_ORDER:
         entries = by_verdict[verdict_key]
         if not entries:
@@ -129,6 +168,13 @@ def generate_report(
         for finding, verdict in entries:
             lines.append(_finding_header(finding, verdict))
             lines.append(_finding_body(finding, verdict))
+            # Annotate with exploit result if present
+            er = exploits.get(finding.finding_id)
+            if er:
+                if er.verified:
+                    lines.append(f"\n**Exploit status**: 💥 verified ({er.exploit_type})")
+                else:
+                    lines.append(f"\n**Exploit status**: not verified — {er.failure_reason or 'unknown reason'}")
             lines.append("")
             lines.append("---")
             lines.append("")
@@ -143,6 +189,35 @@ def generate_report(
             sev_icon = SEVERITY_EMOJI.get(f.severity, "⚪")
             cwe = f" · {f.cwe}" if f.cwe else ""
             lines.append(f"- {sev_icon} `{f.path}:{f.line}` — `{f.rule_id}`{cwe}")
+        lines.append("")
+
+    # Exploit failures (non-verified attempts)
+    if failed_exploits:
+        lines.append(f"## Exploit Attempts — Not Verified ({len(failed_exploits)})")
+        lines.append("")
+        for er in failed_exploits:
+            finding = finding_map.get(er.finding_id)
+            loc = f"`{finding.path}:{finding.line}`" if finding else f"`{er.finding_id}`"
+            reason = er.failure_reason or "no reason given"
+            lines.append(f"- {loc}: {reason}")
+        lines.append("")
+
+    # Filtered findings
+    if skipped:
+        lines.append(f"## Filtered Out ({len(skipped)})")
+        lines.append("")
+        lines.append(
+            "These findings were deprioritised by the triage filter "
+            "(`--triage-top-percent` / `--triage-threshold`) and were not investigated."
+        )
+        lines.append("")
+        for f in skipped:
+            sev_icon = SEVERITY_EMOJI.get(f.severity, "⚪")
+            cwe = f" · {f.cwe}" if f.cwe else ""
+            lines.append(
+                f"- {sev_icon} `{f.path}:{f.line}` — `{f.rule_id}`{cwe}  \n"
+                f"  {f.message[:120]}"
+            )
         lines.append("")
 
     return "\n".join(lines)

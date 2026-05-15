@@ -88,6 +88,69 @@ Do NOT guess. Investigate thoroughly, then submit once.
 """
 
 
+def build_exploit_prompt(finding: "SemgrepFinding", verdict: "TriageVerdict") -> str:  # noqa: F821
+    """System prompt for an ExploitSolver attempting to verify a triage verdict."""
+    from backend.output_types import TriageVerdict  # local import avoids circular
+
+    poc = verdict.proof_of_concept or "None provided."
+    remediation = verdict.remediation or "None provided."
+    finding_json = json.dumps(
+        {
+            "finding_id": finding.finding_id,
+            "rule_id": finding.rule_id,
+            "severity": finding.severity,
+            "path": finding.path,
+            "line": finding.line,
+            "cwe": finding.cwe,
+            "message": finding.message,
+            "code_snippet": finding.code_snippet,
+        },
+        indent=2,
+    )
+
+    return f"""\
+You are an exploit developer verifying whether a reported vulnerability is genuinely exploitable.
+
+## Finding
+
+```json
+{finding_json}
+```
+
+## Triage Verdict
+
+- **Verdict**: {verdict.verdict} (confidence {verdict.confidence:.0%})
+- **Exploitability**: {verdict.exploitability}
+- **Reasoning**: {verdict.reasoning}
+- **Proof of concept hint**: {poc}
+- **Remediation hint**: {remediation}
+
+## Your Task
+
+1. Read the source code at /target to understand the vulnerability.
+2. Install dependencies and start the target application (`run_target <cmd>` or `cd /target && <start cmd> &`).
+3. Wait for the app to start (use `sleep 2` or probe localhost until it responds).
+4. Attempt the exploit:
+   - Use `curl`, `python3`, or other tools to send crafted requests.
+   - Check responses for evidence of success (reflected XSS payload, SQL error, command output, etc.).
+5. If you succeed, capture the exploit script and output.
+6. Submit your result with:
+
+```
+submit_exploit_result '{{"verified": true/false, "exploit_type": "...", "exploit_script": "...", "exploit_output": "...", "evidence": "...", "failure_reason": "..."}}'
+```
+
+## Rules
+
+- `verified: true` only if you have concrete evidence the exploit works (not just that the code looks vulnerable).
+- `exploit_type`: short label, e.g. "sqli", "xss", "rce", "ssrf", "auth-bypass", "idor", "path-traversal".
+- `exploit_output`: the relevant portion of the HTTP response or command output (max 2000 chars).
+- `evidence`: one sentence explaining what proved the exploit worked.
+- `failure_reason`: if not verified, explain why (app didn't start, input validated, not reachable, etc.).
+- Be honest. False negatives are acceptable; false positives waste responder time.
+"""
+
+
 def build_coordinator_prompt(n_findings: int) -> str:
     """System prompt for the triage coordinator."""
     return f"""\

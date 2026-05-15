@@ -22,6 +22,20 @@ class SemgrepFinding:
     cwe: str              # CWE tag or empty string
 
 
+@dataclass
+class ExploitResult:
+    """Result from an ExploitSolver attempting to verify a vulnerability."""
+
+    finding_id: str
+    verified: bool
+    exploit_type: str = ""       # e.g. "sqli", "xss", "rce", "auth-bypass"
+    exploit_script: str = ""     # reproduce commands / code
+    exploit_output: str = ""     # capped at 4 KB
+    evidence: str = ""           # what proved success
+    failure_reason: str = ""     # why verification failed (if not verified)
+    cost_usd: float = 0.0
+
+
 class TriageVerdict(BaseModel):
     finding_id: str
     verdict: Literal["confirmed", "likely", "uncertain", "false_positive"]
