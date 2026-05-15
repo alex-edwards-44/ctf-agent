@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,29 @@ SEVERITY_ALIASES: dict[str, str] = {
     "info": "INFO",
     "all": "INFO",  # "all" means include everything down to INFO
 }
+
+# Default rule packs run when no --semgrep-config or --semgrep-rules is given
+DEFAULT_PACKS: list[str] = [
+    "p/security-audit",
+    "p/owasp-top-ten",
+    "p/cwe-top-25",
+    "p/secrets",
+]
+
+# OWASP Top 10 2021 CWE IDs — findings matching these rank higher in triage filtering
+_OWASP_CWES: frozenset[str] = frozenset({
+    "CWE-20", "CWE-22", "CWE-73", "CWE-74", "CWE-77", "CWE-78", "CWE-79",
+    "CWE-89", "CWE-90", "CWE-94", "CWE-116", "CWE-200", "CWE-209",
+    "CWE-284", "CWE-285", "CWE-287", "CWE-306", "CWE-311", "CWE-326",
+    "CWE-327", "CWE-345", "CWE-346", "CWE-352", "CWE-384", "CWE-502",
+    "CWE-611", "CWE-732", "CWE-798", "CWE-918",
+})
+
+
+def _cwe_id(cwe_str: str) -> str:
+    """Extract canonical CWE ID (e.g. 'CWE-89') from a metadata CWE string."""
+    m = re.match(r"(CWE-\d+)", cwe_str.strip(), re.IGNORECASE)
+    return m.group(1).upper() if m else ""
 
 
 def _extract_cwe(metadata: dict) -> str:
@@ -143,3 +167,69 @@ def run_semgrep(
         len(findings), severity_min.upper(),
     )
     return findings
+
+
+def _dedup_findings(findings: list[SemgrepFinding]) -> list[SemgrepFinding]:
+    seen: set[tuple[str, int, str]] = set()
+    out: list[SemgrepFinding] = []
+    for f in findings:
+        key = (f.path, f.line, f.rule_id)
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
+
+
+def run_semgrep_multi(
+    target_dir: str,
+    configs: list[str] | None = None,
+    severity_min: str = "warning",
+) -> list[SemgrepFinding]:
+    """Run Semgrep with multiple rule packs and return deduplicated, sorted findings."""
+    packs = configs if configs is not None else DEFAULT_PACKS
+    all_findings: list[SemgrepFinding] = []
+    for pack in packs:
+        found = run_semgrep(target_dir, config=pack, severity_min=severity_min)
+        all_findings.extend(found)
+    deduped = _sort_findings(_dedup_findings(all_findings))
+    logger.info(
+        "Multi-pack scan: %d unique finding(s) from %d pack(s)",
+        len(deduped), len(packs),
+    )
+    return deduped
+
+
+def filter_findings(
+    findings: list[SemgrepFinding],
+    top_percent: float = 100.0,
+    threshold: int = 100,
+    target_dir: str = "",
+) -> tuple[list[SemgrepFinding], list[SemgrepFinding]]:
+    """Return (to_triage, skipped).
+
+    Filtering activates when len(findings) > threshold AND top_percent < 100.
+    Prioritisation: ERROR > WARNING > INFO, then OWASP CWEs first, then smaller files first.
+    """
+    n = len(findings)
+    if top_percent >= 100.0 or n <= threshold:
+        return findings, []
+
+    keep_n = max(1, int(n * top_percent / 100.0))
+
+    def _score(f: SemgrepFinding) -> tuple:
+        sev = SEVERITY_ORDER.get(f.severity, 99)
+        is_owasp = 0 if _cwe_id(f.cwe) in _OWASP_CWES else 1
+        fsize = 0
+        if target_dir:
+            try:
+                fsize = Path(target_dir, f.path).stat().st_size
+            except OSError:
+                pass
+        return (sev, is_owasp, fsize)
+
+    prioritized = sorted(findings, key=_score)
+    logger.info(
+        "Triage filter active: keeping %d/%d findings (top %.0f%% of %d > threshold %d)",
+        keep_n, n, top_percent, n, threshold,
+    )
+    return prioritized[:keep_n], prioritized[keep_n:]
